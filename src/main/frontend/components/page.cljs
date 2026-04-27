@@ -174,7 +174,7 @@
           block? (not (db/page? block))
           full-children (->> (:block/_parent block)
                              ldb/sort-by-order)
-          mobile-length-limit 50
+          mobile-length-limit 10000
           [children more?] (if (and (> (count full-children) mobile-length-limit) (util/mobile?) journals?)
                              [(take mobile-length-limit full-children) true]
                              [full-children false])
