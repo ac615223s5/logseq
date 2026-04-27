@@ -1827,8 +1827,8 @@
 ;; Progressive root rendering should kick in for pages with either many root
 ;; blocks or heavy expanded descendant trees.
 (def ^:private defer-root-render-batch-size 1)
-(def ^:private defer-children-initial-render-budget 12)
-(def ^:private defer-children-render-batch-budget 12)
+(def ^:private defer-children-initial-render-budget 10000)
+(def ^:private defer-children-render-batch-budget 10000)
 
 (defn- should-defer-root-block-render?
   [config root-block blocks anchor]
@@ -1845,7 +1845,7 @@
               (:embed? config)
               (:library? config)
               (:document/mode? config)))
-     (>= (- page-blocks-count children-blocks-count) 30))))
+     (>= (- page-blocks-count children-blocks-count) 10000))))
 
 (defn- defer-placeholder-element
   []
@@ -4077,8 +4077,8 @@
         [virtualized? _] (hooks/use-state (not (or (util/rtc-test?)
                                                    (and (util/mobile?) (:journals? config))
                                                    (if (:journals? config)
-                                                     (< blocks-count 50)
-                                                     (< blocks-count 10))
+                                                     (< blocks-count 10000)
+                                                     (< blocks-count 10000))
                                                    (and (:block-children? config)
                                                         ;; zoom-in block's children
                                                         (not (and (:id config) (= (:id config) (str (:block/uuid (:block/parent (first blocks)))))))))))
