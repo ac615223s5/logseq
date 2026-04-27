@@ -1958,8 +1958,8 @@
 ;; Progressive root rendering should kick in for pages with either many root
 ;; blocks or heavy expanded descendant trees.
 (def ^:private defer-root-render-batch-size 1)
-(def ^:private defer-children-initial-render-budget 12)
-(def ^:private defer-children-render-batch-budget 12)
+(def ^:private defer-children-initial-render-budget 10000)
+(def ^:private defer-children-render-batch-budget 10000)
 
 (defn- should-defer-root-block-render?
   [config root-block blocks anchor]
@@ -1977,7 +1977,7 @@
                               (:document/mode? config))
         heavy-journal-root? (and (:journals? config)
                                  (>= children-blocks-count 50))
-        heavy-descendant-tree? (>= (- page-blocks-count children-blocks-count) 30)]
+        heavy-descendant-tree? (>= (- page-blocks-count children-blocks-count) 10000)]
     (and root-surface?
          root-level?
          (not excluded-context?)
@@ -5198,7 +5198,7 @@
                                                (str (:block/uuid (:block/parent (first blocks))))))))
         disable-virtualized? (or (util/rtc-test?)
                                  (:journals? config)
-                                 (< blocks-count 10)
+                                 (< blocks-count 10000)
                                  zoomed-child-blocks?)
         [virtualized? _] (hooks/use-state (not disable-virtualized?))
         root-level? (zero? (or (:level config) 0))
