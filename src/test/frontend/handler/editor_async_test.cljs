@@ -74,18 +74,21 @@
           util/get-prev-block-non-collapsed-non-embed (constantly sibling-dom)
                   ;; stub b/c of js/document
           state/get-selection-blocks (constantly [])
-          util/get-blocks-noncollapse (constantly (mapv
-                                                   (fn [m]
-                                                     #js {:id (:id m)
-                                                                  ;; for dom/attr
-                                                          :getAttribute #({"blockid" (str (:block-uuid m))
-                                                                           "data-embed" (if embed? "true" "false")} %)})
-                                                   [{:id "ls-block-first-block"
-                                                     :block-uuid (:block/uuid first-block)}
-                                                    {:id sibling-dom-id
-                                                     :block-uuid (:block/uuid sibling-block)}
-                                                    {:id block-dom-id
-                                                     :block-uuid (:block/uuid block)}]))
+          util/get-blocks-dom-array (constantly (to-array
+                                                 (mapv
+                                                  (fn [m]
+                                                    #js {:id (:id m)
+                                                         ;; visible to the directional scan
+                                                         :offsetParent #js {}
+                                                                 ;; for dom/attr
+                                                         :getAttribute #({"blockid" (str (:block-uuid m))
+                                                                          "data-embed" (if embed? "true" "false")} %)})
+                                                  [{:id "ls-block-first-block"
+                                                    :block-uuid (:block/uuid first-block)}
+                                                   {:id sibling-dom-id
+                                                    :block-uuid (:block/uuid sibling-block)}
+                                                   {:id block-dom-id
+                                                    :block-uuid (:block/uuid block)}])))
           util/schedule (fn [f]
                           (if schedule-immediately?
                             (f)
