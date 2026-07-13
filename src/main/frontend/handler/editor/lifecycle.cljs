@@ -35,7 +35,10 @@
           (state/<invoke-db-worker :thread-api/undo-redo-record-editor-info
                                    repo
                                    editor-info))))
-    (state/set-state! :editor/op nil))
+    (state/set-state! :editor/op nil)
+
+    ;; Replay arrow keys queued while this editor was mounting.
+    (editor-handler/replay-queued-up-down!))
   state)
 
 ;; (defn will-remount!

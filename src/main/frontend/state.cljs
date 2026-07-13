@@ -189,6 +189,9 @@
       :editor/args                           (atom nil)
       :editor/on-paste?                      (atom false)
       :editor/last-key-code                  (atom nil)
+      ;; Cross-block up/down transition bookkeeping:
+      ;; nil | {:in-flight? bool :queue [:up|:down ...] :updated-at ms}
+      :editor/up-down-transition             (atom nil)
       :ui/global-last-key-code               (atom nil)
       :editor/block-op-type                  nil ;; :cut, :copy
       :editor/block-refs                     (atom #{})
@@ -866,6 +869,68 @@ Similar to re-frame subscriptions"
 (defn editing?
   []
   (seq @(:editor/editing? @state)))
+
+;; While the editor moves between blocks (save -> edit-block! -> React
+;; mount -> focus), there is a window where no textarea is focused and
+;; up/down keypresses would be lost or act on the wrong block. The
+;; handlers queue arrow keys during that window and replay them once the
+;; new editor mounts.
+(def ^:private up-down-transition-timeout-ms 400)
+(def ^:private up-down-queue-cap 5)
+
+(defn up-down-transition-pending?
+  "True while a cross-block up/down transition is in flight or queued keys
+   await replay. Stale entries (older than the timeout) are cleared and
+   reported false, so a stuck flag can never eat arrow keys for long."
+  []
+  (let [a (:editor/up-down-transition @state)]
+    (when-let [{:keys [in-flight? queue updated-at]} @a]
+      (if (and (< (- (util/time-ms) updated-at) up-down-transition-timeout-ms)
+               (or in-flight? (seq queue)))
+        true
+        (do (reset! a nil) false)))))
+
+(defn start-up-down-transition!
+  []
+  (swap! (:editor/up-down-transition @state)
+         (fn [m] {:in-flight? true
+                  :queue (vec (:queue m))
+                  :updated-at (util/time-ms)})))
+
+(defn end-up-down-in-flight!
+  []
+  (swap! (:editor/up-down-transition @state)
+         (fn [m] (some-> m (assoc :in-flight? false :updated-at (util/time-ms))))))
+
+(defn enqueue-up-down-key!
+  [direction]
+  (swap! (:editor/up-down-transition @state)
+         (fn [m] (when m
+                   (cond-> (assoc m :updated-at (util/time-ms))
+                     (< (count (:queue m)) up-down-queue-cap)
+                     (update :queue (fnil conj []) direction))))))
+
+(defn pop-up-down-key!
+  "Pops the oldest queued direction; clears the entry when drained.
+   Returns the direction or nil."
+  []
+  (let [a (:editor/up-down-transition @state)
+        {:keys [queue in-flight?]} @a]
+    (when-let [dir (first queue)]
+      (if (and (= 1 (count queue)) (not in-flight?))
+        (reset! a nil)
+        (swap! a (fn [m] (-> m
+                             (update :queue #(vec (rest %)))
+                             (assoc :updated-at (util/time-ms))))))
+      dir)))
+
+(defn up-down-in-flight?
+  []
+  (boolean (:in-flight? @(:editor/up-down-transition @state))))
+
+(defn clear-up-down-transition!
+  []
+  (reset! (:editor/up-down-transition @state) nil))
 
 (defn get-edit-input-id
   []
