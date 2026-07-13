@@ -798,78 +798,108 @@
            (gdom/getElement section "id"))))))
 
 #?(:cljs
-   (defn- skip-same-top-blocks
-     [blocks block]
-     (let [property? (= (d/attr block "data-is-property") "true")
-           properties-area (rec-get-node block "ls-properties-area")]
-       (remove (fn [b]
-                 (and
-                  (not= b block)
-                  (or (= (when b (.-top (.getBoundingClientRect b)))
-                         (when block (.-top (.getBoundingClientRect block))))
-                      (when property?
-                        (and (not= (d/attr b "data-is-property") "true")
-                             (gdom/contains properties-area b)))))) blocks))))
+   (defn get-blocks-dom-array
+     "All .ls-block nodes under `container` (default: whole document) in
+      document order, as a native JS array. No visibility filtering —
+      directional scans check `offsetParent` per candidate instead."
+     ([] (get-blocks-dom-array js/document))
+     ([container] (js/Array.from (.querySelectorAll ^js container "div .ls-block")))))
+
+#?(:cljs
+   (defn- block-visible?
+     [^js b]
+     (some? (gobj/get b "offsetParent"))))
+
+#?(:cljs
+   (defn- scan-sibling-block
+     "Directional scan around `block` in the native array `blocks` (dir -1/1),
+      returning the first candidate passing `pred`. Reproduces the quirks of
+      the previous filter-then-indexOf implementation: when `block` is nil,
+      absent, or fails `in-list-pred`, prev returns nil and next scans from
+      index 0."
+     ([blocks block dir pred] (scan-sibling-block blocks block dir pred pred))
+     ([blocks block dir pred in-list-pred]
+      (when blocks
+        (let [len (alength blocks)
+              i (if (some? block) (.indexOf ^js blocks block) -1)
+              in-list? (and (>= i 0) (in-list-pred (aget blocks i)))
+              start (cond in-list? (+ i dir)
+                          (neg? dir) nil
+                          :else 0)]
+          (when (some? start)
+            (loop [j start]
+              (when (and (>= j 0) (< j len))
+                (let [b (aget blocks j)]
+                  (if (pred b) b (recur (+ j dir))))))))))))
+
+#?(:cljs
+   (defn- up-down-skip-pred
+     "Per-candidate predicate for up/down moves: skip blocks on the same
+      visual row as `block`, and when `block` is a property block, also skip
+      non-property blocks inside its properties area. The reference block
+      itself always passes."
+     [block]
+     (let [cur-top (.-top (.getBoundingClientRect ^js block))
+           property? (= (d/attr block "data-is-property") "true")
+           properties-area (when property? (rec-get-node block "ls-properties-area"))]
+       (fn [^js b]
+         (or (identical? b block)
+             (and (not= cur-top (.-top (.getBoundingClientRect b)))
+                  (not (and property?
+                            (not= (d/attr b "data-is-property") "true")
+                            (gdom/contains properties-area b)))))))))
+
+#?(:cljs
+   (defn- non-collapsed-pred
+     [block {:keys [up-down? exclude-property?]}]
+     (let [same-row-ok? (when (and up-down? block) (up-down-skip-pred block))]
+       (fn [b]
+         (and (block-visible? b)
+              (or (nil? same-row-ok?) (same-row-ok? b))
+              (or (not exclude-property?)
+                  (not (d/has-class? b "property-value-container"))))))))
 
 #?(:cljs
    (defn get-prev-block-non-collapsed
      "Gets previous non-collapsed block. If given a container
       looks up blocks in that container e.g. for embed"
      ([block] (get-prev-block-non-collapsed block {}))
-     ([block {:keys [container up-down? exclude-property?]}]
-      (when-let [blocks (if container
-                          (get-blocks-noncollapse container)
-                          (get-blocks-noncollapse))]
-        (let [blocks (cond->>
-                      (if up-down?
-                        (skip-same-top-blocks blocks block)
-                        blocks)
-                       exclude-property?
-                       (remove (fn [node] (d/has-class? node "property-value-container"))))]
-          (when-let [index (.indexOf blocks block)]
-            (let [idx (dec index)]
-              (when (>= idx 0)
-                (nth-safe blocks idx)))))))))
+     ([block {:keys [container] :as opts}]
+      (let [blocks (if container
+                     (get-blocks-dom-array container)
+                     (get-blocks-dom-array))]
+        (scan-sibling-block blocks block -1 (non-collapsed-pred block opts))))))
 
 #?(:cljs
    (defn get-prev-block-non-collapsed-non-embed
      [block]
-     (when-let [blocks (->> (get-blocks-noncollapse)
-                            remove-embedded-blocks
-                            remove-property-value-blocks)]
-       (when-let [index (.indexOf blocks block)]
-         (let [idx (dec index)]
-           (when (>= idx 0)
-             (nth-safe blocks idx)))))))
+     (scan-sibling-block
+      (get-blocks-dom-array) block -1
+      (fn [b] (and (block-visible? b)
+                   (not= "true" (d/attr b "data-embed"))
+                   (not (d/has-class? b "property-value-container")))))))
 
 #?(:cljs
    (defn get-next-block-non-collapsed
-     [block {:keys [up-down? exclude-property?]}]
-     (when-let [blocks (and block (get-blocks-noncollapse))]
-       (let [blocks (cond->>
-                     (if up-down?
-                       (skip-same-top-blocks blocks block)
-                       blocks)
-                      exclude-property?
-                      (remove (fn [node] (d/has-class? node "property-value-container"))))]
-         (when-let [index (.indexOf blocks block)]
-           (let [idx (inc index)]
-             (when (>= (count blocks) idx)
-               (nth-safe blocks idx))))))))
+     ([block] (get-next-block-non-collapsed block nil))
+     ([block opts]
+      (when block
+        (scan-sibling-block (get-blocks-dom-array) block 1
+                            (non-collapsed-pred block opts))))))
 
 #?(:cljs
    (defn get-next-block-non-collapsed-skip
+     "Next non-collapsed block, skipping candidates nested inside an
+      already-selected block. NOTE: some callers pass an opts map that has
+      always been ignored (single arity) — downward selection intentionally
+      applies neither `up-down?` nor `exclude-property?` filtering."
      [block]
-     (when-let [blocks (get-blocks-noncollapse)]
-       (when-let [index (.indexOf blocks block)]
-         (loop [idx (inc index)]
-           (when (>= (count blocks) idx)
-             (let [block (nth-safe blocks idx)
-                   nested? (->> (array-seq (gdom/getElementsByClass "selected"))
-                                (some (fn [dom] (.contains dom block))))]
-               (if nested?
-                 (recur (inc idx))
-                 block))))))))
+     (let [selected (js/Array.from (gdom/getElementsByClass "selected"))]
+       (scan-sibling-block
+        (get-blocks-dom-array) block 1
+        (fn [^js b] (and (block-visible? b)
+                         (not (.some selected (fn [^js dom] (.contains dom b))))))
+        block-visible?))))
 
 (defn rand-str
   [n]
