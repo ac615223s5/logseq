@@ -4210,9 +4210,10 @@
 
     [:div.flex.flex-col.w-full
      (let [comments-area? (comments-model/comments-area? block)
-           parsed-block (merge block (block/parse-title-and-body uuid (get block :block/format :markdown) title))
+           ;; No parse-title-and-body merge here: block-content and
+           ;; text-block-title derive :block.temp/ast-* themselves.
            hide-block-refs-count? (or (and (:embed? config)
-                                        (= (:block/uuid parsed-block) (:embed-id config)))
+                                        (= (:block/uuid block) (:embed-id config)))
                                     table?)]
        (if comments-area?
          (block-comments/comments-area-view
@@ -4226,7 +4227,7 @@
           :block-reactions block-reactions}
           {})
          (block-content-or-editor config
-           parsed-block
+           block
            {:edit-input-id edit-input-id
             :block-id block-id
             :edit? editing?

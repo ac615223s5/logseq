@@ -21,6 +21,32 @@
              second
              int)})
 
+(defn- ensure-mock-text!
+  "Builds #mock-text's per-grapheme measurement spans imperatively iff its
+   spans were built from different content. The content marker is an expando
+   on the element itself, so a fresh mount (new element) auto-invalidates.
+   The editor component renders #mock-text empty; spans are only needed by
+   the caret-measurement fns below, all reached via `get-caret-pos`.
+   Returns the element or nil."
+  [content]
+  (when-let [el (gdom/getElement "mock-text")]
+    (when-not (= content (gobj/get el "__mockTextContent"))
+      (gobj/set el "__mockTextContent" content)
+      (let [frag (js/document.createDocumentFragment)]
+        (reduce (fn [char-idx g]
+                  (let [span (js/document.createElement "span")]
+                    (set! (.-id span) (str "mock-text_" char-idx))
+                    (if (= g "\n")
+                      (do (set! (.-textContent span) "0")
+                          (.appendChild span (js/document.createElement "br")))
+                      (set! (.-textContent span) g))
+                    (.appendChild frag span)
+                    (+ char-idx (count g))))
+                0
+                (util/split-graphemes (str content "0")))
+        (.replaceChildren el frag)))
+    el))
+
 (defn get-caret-pos
   "Get caret offset position as well as input element rect.
 
@@ -34,7 +60,7 @@
      (let [rect (bean/->clj (.. input (getBoundingClientRect) (toJSON)))
            grapheme-pos (util/get-graphemes-pos (.-value input) pos)]
        (try
-         (some-> (gdom/getElement "mock-text")
+         (some-> (ensure-mock-text! (.-value input))
                  gdom/getChildren
                  array-seq
                  (util/nth-safe grapheme-pos)
