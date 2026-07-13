@@ -565,23 +565,20 @@
               nil)))
      (state/set-state! :editor/on-paste? false)
      state)}
-  [content]
+  [_content]
+  ;; The per-grapheme spans used for caret measurement are built lazily by
+  ;; frontend.util.cursor/ensure-mock-text! the first time something needs
+  ;; them (caret pos for popups, up/down moves). Building them on every
+  ;; mount/update made entering and leaving a block's editor expensive.
+  ;; `_content` stays an argument so :did-update still fires on change for
+  ;; handle-last-input.
   [:div#mock-text
    {:style {:width "100%"
             :height "100%"
             :position "absolute"
             :visibility "hidden"
             :top 0
-            :left 0}}
-   (let [content (str content "0")
-         graphemes (util/split-graphemes content)
-         graphemes-char-index (reductions #(+ %1 (count %2)) 0 graphemes)]
-     (for [[idx c] (into (sorted-map) (zipmap graphemes-char-index graphemes))]
-       (if (= c "\n")
-         [:span {:id (str "mock-text_" idx)
-                 :key idx} "0" [:br]]
-         [:span {:id (str "mock-text_" idx)
-                 :key idx} c])))])
+            :left 0}}])
 
 (defn- open-editor-popup!
   [id content opts]

@@ -3470,8 +3470,9 @@
 
           ;; Not embed self
           [:div.flex.flex-col.w-full
-           (let [block (merge block (block/parse-title-and-body uuid (get block :block/format :markdown) title))
-                 hide-block-refs-count? (or (and (:embed? config)
+           ;; No parse-title-and-body merge here: block-content and
+           ;; text-block-title derive :block.temp/ast-* themselves.
+           (let [hide-block-refs-count? (or (and (:embed? config)
                                                  (= (:block/uuid block) (:embed-id config)))
                                             table?)]
              (block-content-or-editor config
