@@ -2592,54 +2592,69 @@
                                            (nil? (property-value-inner-block property-value-container)))]
         (if sibling-block
           (let [value (state/get-edit-content)]
-            (p/do!
-             (when (and
-                    uuid
-                    (not (state/block-component-editing?))
-                    (not= title (string/trim value)))
-               (save-block! repo uuid value))
+            ;; Mark the transition before the async chain so arrow keys
+            ;; pressed while it runs are queued instead of lost/misrouted.
+            (state/start-up-down-transition!)
+            (-> (p/do!
+                 (when (and
+                        uuid
+                        (not (state/block-component-editing?))
+                        (not= title (string/trim value)))
+                   (save-block! repo uuid value))
 
-             (cond
-               (and (= :down direction)
-                    input
-                    (= active-element input)
-                    current-bottom-properties-row)
-               (do
-                 (state/clear-edit!)
-                 (focus-bottom-properties-row! current-bottom-properties-row))
+                 (cond
+                   ;; Branches that don't mount a block editor: no did-mount
+                   ;; will drain the queue, so drop any queued keys rather
+                   ;; than misroute them.
+                   (and (= :down direction)
+                        input
+                        (= active-element input)
+                        current-bottom-properties-row)
+                   (do
+                     (state/clear-edit!)
+                     (focus-bottom-properties-row! current-bottom-properties-row)
+                     (state/clear-up-down-transition!))
 
-               (and (= :up direction)
-                    sibling-bottom-properties-row)
-               (do
-                 (state/clear-edit!)
-                 (focus-bottom-properties-row! sibling-bottom-properties-row))
+                   (and (= :up direction)
+                        sibling-bottom-properties-row)
+                   (do
+                     (state/clear-edit!)
+                     (focus-bottom-properties-row! sibling-bottom-properties-row)
+                     (state/clear-up-down-transition!))
 
-               (and (dom/has-class? sibling-block "block-add-button")
-                    (util/rec-get-node current-block "ls-page-title"))
-               (.click sibling-block)
+                   (and (dom/has-class? sibling-block "block-add-button")
+                        (util/rec-get-node current-block "ls-page-title"))
+                   (do (.click sibling-block)
+                       (state/clear-up-down-transition!))
 
-               bottom-properties-row
-               (do
-                 (state/clear-edit!)
-                 (focus-bottom-properties-row! bottom-properties-row))
+                   bottom-properties-row
+                   (do
+                     (state/clear-edit!)
+                     (focus-bottom-properties-row! bottom-properties-row)
+                     (state/clear-up-down-transition!))
 
-               property-value-container?
-               (focus-trigger current-block sibling-block {:edit-navigation? true})
+                   property-value-container?
+                   (do (focus-trigger current-block sibling-block {:edit-navigation? true})
+                       (state/clear-up-down-transition!))
 
-               (comments-area-node? sibling-block)
-               (enter-comments-area-node! sibling-block)
+                   (comments-area-node? sibling-block)
+                   (do (enter-comments-area-node! sibling-block)
+                       (state/clear-up-down-transition!))
 
-               :else
-               (when-let [sibling-block-id (node-attr sibling-block "blockid")]
-                 (let [container-id (some-> (node-attr sibling-block "containerid") js/parseInt)
-                       new-uuid (cljs.core/uuid sibling-block-id)
-                       block (db/entity [:block/uuid new-uuid])]
-                   (edit-block! block
-                                (or (:pos move-opts)
-                                    (when input [direction (util/get-line-pos (.-value input) (util/get-selection-start input))])
-                                    0)
-                                {:container-id container-id
-                                 :direction direction}))))))
+                   :else
+                   (when-let [sibling-block-id (node-attr sibling-block "blockid")]
+                     (let [container-id (some-> (node-attr sibling-block "containerid") js/parseInt)
+                           new-uuid (cljs.core/uuid sibling-block-id)
+                           block (db/entity [:block/uuid new-uuid])]
+                       (edit-block! block
+                                    (or (:pos move-opts)
+                                        (when input [direction (util/get-line-pos (.-value input) (util/get-selection-start input))])
+                                        0)
+                                    {:container-id container-id
+                                     :direction direction})))))
+                (p/catch (fn [error]
+                           (state/clear-up-down-transition!)
+                           (log/error :editor/move-cross-boundary-up-down error)))))
           (case direction
             :up (if input
                   (cursor/move-cursor-to input 0)
@@ -3377,6 +3392,14 @@
                (not (state/get-timestamp-block)))
       (util/stop e)
       (cond
+        ;; Cross-block transition in flight: the old textarea has blurred
+        ;; and the new one isn't focused yet, so editing?/get-input are
+        ;; unreliable (get-input can even resolve to the old block via the
+        ;; activeElement fallback). Queue the key for replay after the new
+        ;; editor mounts instead of losing or misrouting it.
+        (state/up-down-transition-pending?)
+        (state/enqueue-up-down-key! direction)
+
         (state/editing?)
         (keydown-up-down-handler direction {})
 
@@ -3388,6 +3411,33 @@
         (not (state/get-edit-input-id))
         (select-first-last direction)))
     nil))
+
+(defn replay-queued-up-down!
+  "Called after an editor mounts. Ends the in-flight transition and replays
+   queued arrow keys against the freshly focused input, re-checking guards
+   at drain time. Stops as soon as a replayed key starts a new crossing —
+   that crossing's did-mount continues the drain."
+  []
+  (when (state/up-down-transition-pending?)
+    (state/end-up-down-in-flight!)
+    ;; setTimeout 0: don't mutate editing state inside React's commit phase.
+    ;; New presses in the gap still enqueue because pending? stays true
+    ;; while the queue is non-empty.
+    (js/setTimeout
+     (fn []
+       (loop []
+         (when-not (state/up-down-in-flight?)
+           (if (and (state/editing?)
+                    (not (auto-complete?))
+                    (not (in-shui-popup?))
+                    (not (state/get-timestamp-block)))
+             (when-let [direction (state/pop-up-down-key!)]
+               (keydown-up-down-handler direction {})
+               (recur))
+             ;; Guards fail (popup opened, editing exited): drop the rest
+             ;; rather than misroute the keys.
+             (state/clear-up-down-transition!)))))
+     0)))
 
 (defn shortcut-select-up-down [direction]
   (fn [e]
