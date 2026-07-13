@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm run *)",
+      "Bash(wget -q https://github.com/clojure/brewtx/releases/download/v1.12.0.1/clojure-1.12.0.1157-linux-x86_64.tar.gz -O /tmp/clojure.tar.gz)",
+      "Bash(tar -tzf /tmp/clojure.tar.gz)",
+      "Bash(curl -sI https://github.com/clojure/brewtx/releases/latest)",
+      "Bash(curl -sL https://github.com/clojure/brewtx/releases/latest)",
+      "Bash(curl -sI https://github.com)",
+      "Bash(curl -s \"https://api.github.com/repos/clojure/brewtx/releases?per_page=3\")",
+      "WebFetch(domain:clojure.org)",
+      "Bash(pnpm config *)",
+      "Bash(pnpm install *)",
+      "Bash(node /home/sunshine/Downloads/logseq/static/node_modules/electron/install.js)",
+      "Bash(npx clojure *)",
+      "Bash(clojure -M:cljs compile app)",
+      "Bash(git checkout *)"
+    ]
+  }
+}
