@@ -3,7 +3,7 @@
 
  :config-in-ns
  ;; :used-underscored-binding is turned off for components because of false positive
- ;; for rum/defcs and _state.
+ ;; for component macros and _state.
  {all-components
   {:linters {:used-underscored-binding {:level :off}}}
 
@@ -30,7 +30,6 @@
                            fn t ex-data list int? hash range
                            time sort-by namespace count parents exists? min
                            new var ns resolve identity next meta vals keys exists?]}
-  ;; Disable until it doesn't trigger false positives on rum/defcontext
   :earmuffed-var-not-dynamic {:level :off}
   ;; Disable until we decide to use conj! as recommended in docs
   :unused-value {:level :off}
@@ -38,12 +37,6 @@
                                 goog.string.unescapeEntities
                                 ;; TODO:lint: Fix when fixing all type hints
                                 object]}
-
-  :discouraged-var
-  {rum.core/use-effect! {:message "Use frontend.hooks/use-effect! instead" :level :info}
-   rum.core/use-memo {:message "Use frontend.hooks/use-memo instead" :level :info}
-   rum.core/use-layout-effect! {:message "Use frontend.hooks/use-layout-effect! instead" :level :info}
-   rum.core/use-callback {:message "Use frontend.hooks/use-callback instead" :level :info}}
   :unused-namespace {:level :warning
                      :exclude [logseq.db.common.entity-plus]}
 
@@ -70,16 +63,14 @@
              electron.ipc ipc
              electron.utils utils
              frontend.commands commands
-             frontend.common.date common-date
-             frontend.common.missionary-util c.m
-             frontend.common.schema-register sr
+             frontend.common.idb idb
+             frontend.common.missionary c.m
              frontend.common.search-fuzzy fuzzy
              frontend.components.block.macros block-macros
              frontend.components.class class-component
              frontend.components.property property-component
              frontend.components.query query
              frontend.components.query.result query-result
-             frontend.components.title title
              frontend.config config
              frontend.date date
              frontend.db db
@@ -88,9 +79,8 @@
              frontend.db.query-dsl query-dsl
              frontend.db.query-react query-react
              frontend.db.react react
-             frontend.db.util db-utils
+             frontend.db.utils db-utils
              frontend.diff diff
-             frontend.encrypt encrypt
              frontend.extensions.sci sci
              frontend.format.block block
              frontend.format.mldoc mldoc
@@ -106,15 +96,12 @@
              frontend.handler.db-based.page db-page-handler
              frontend.handler.db-based.property db-property-handler
              frontend.handler.db-based.property.util db-pu
-             frontend.handler.editor.property editor-property
              frontend.handler.events events
-             frontend.handler.extract extract
              frontend.handler.global-config global-config-handler
              frontend.handler.notification notification
              frontend.handler.page page-handler
              frontend.handler.plugin plugin-handler
              frontend.handler.plugin-config plugin-config-handler
-             frontend.handler.property.file property-file
              frontend.handler.property.util pu
              frontend.handler.query.builder query-builder
              frontend.handler.repo repo-handler
@@ -122,8 +109,6 @@
              frontend.handler.route route-handler
              frontend.handler.search search-handler
              frontend.handler.ui ui-handler
-             frontend.hooks hooks
-             frontend.idb idb
              frontend.loader loader
              frontend.mixins mixins
              frontend.mobile.util mobile-util
@@ -138,17 +123,15 @@
              frontend.ui ui
              frontend.util util
              frontend.util.page page-util
-             frontend.util.persist-var persist-var
-             frontend.util.property property
              frontend.util.text text-util
              frontend.util.thingatpt thingatpt
              frontend.util.url url-util
              frontend.util.ref ref
+             frontend.worker-common.util worker-util
              frontend.worker.shared-service shared-service
              frontend.worker.handler.page worker-page
              frontend.worker.pipeline worker-pipeline
              frontend.worker.state worker-state
-             frontend.worker.util worker-util
              lambdaisland.glogi log
              logseq.api.db-based db-based-api
              logseq.cli.common.graph cli-common-graph
@@ -159,11 +142,12 @@
              logseq.cli.common.mcp.tools cli-common-mcp-tools
              logseq.cli.text-util cli-text-util
              logseq.common.config common-config
-             logseq.common.date-time-util date-time-util
+             logseq.common.date common-date
              logseq.common.graph common-graph
              logseq.common.path path
              logseq.common.util common-util
              logseq.common.util.block-ref block-ref
+             logseq.common.util.date-time date-time-util
              logseq.common.util.macro macro-util
              logseq.common.util.namespace ns-util
              logseq.common.util.page-ref page-ref
@@ -195,7 +179,6 @@
              logseq.graph-parser.mldoc gp-mldoc
              logseq.graph-parser.property gp-property
              logseq.graph-parser.text text
-             logseq.outliner.batch-tx batch-tx
              logseq.outliner.core outliner-core
              logseq.outliner.datascript-report ds-report
              logseq.outliner.op outliner-op
@@ -203,6 +186,7 @@
              logseq.outliner.pipeline outliner-pipeline
              logseq.outliner.tree otree
              logseq.outliner.validate outliner-validate
+             logseq.shui.hooks hooks
              logseq.shui.popup.core shui-popup
              logseq.shui.ui shui
              medley.core medley
@@ -211,8 +195,7 @@
   :namespace-name-mismatch {:level :warning}
   :used-underscored-binding {:level :warning}}
 
- :hooks {:analyze-call {rum.core/defc hooks.rum/defc
-                        rum.core/defcs hooks.rum/defcs
+ :hooks {:analyze-call {io.factorhouse.hsx.core/defc hooks.hsx/defc
                         clojure.string/join hooks.path-invalid-construct/string-join
                         clojure.string/replace hooks.regex-checks/double-escaped-regex
                         logseq.common.defkeywords/defkeywords hooks.defkeywords/defkeywords
@@ -222,9 +205,6 @@
            promesa.core/recur clojure.core/recur
            promesa.core/doseq clojure.core/doseq
            promesa.core/with-redefs clojure.core/with-redefs
-           rum.core/defcc rum.core/defc
-           rum.core/with-context clojure.core/let
-           rum.core/defcontext clojure.core/def
            clojure.test.check.clojure-test/defspec clojure.core/def
            clojure.test.check.properties/for-all clojure.core/for
            ;; src/main

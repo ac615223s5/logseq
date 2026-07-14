@@ -2,7 +2,10 @@
   (:require [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [logseq.common.config :as common-config]
+            [logseq.common.util :as common-util]
+            [logseq.common.util.date-time :as date-time-util]
             [logseq.common.util.page-ref :as page-ref]
+            [logseq.common.uuid :as common-uuid]
             [logseq.db :as ldb]
             [logseq.db.common.order :as db-order]
             [logseq.db.frontend.db :as db-db]
@@ -95,7 +98,19 @@
          js/Error
          #"can't include \"/"
          (outliner-page/create! conn "foo/bar" {}))
-        "Page can't have '/'n title")))
+        "Page can't have '/'n title")
+
+    (is (thrown-with-msg?
+         js/Error
+         #"can't include \"#\""
+         (outliner-page/create! conn "foo#bar" {}))
+        "Page can't have '#' in title")
+
+    (is (thrown-with-msg?
+         js/Error
+         #"can't include \"#\""
+         (outliner-page/create! conn "#tagstyle" {}))
+        "Page can't have leading '#' in title")))
 
 (deftest delete-page
   (let [conn (db-test/create-conn-with-blocks
@@ -159,3 +174,33 @@
                 :block/tags
                 (map #(:db/ident (d/entity @conn (:db/id %))))))
         "New journal only has Journal tag")))
+
+(deftest create-journal-keeps-default-block-name-with-custom-title-format
+  (let [conn (db-test/create-conn)
+        _ (d/transact! conn [[:db/add :logseq.class/Journal :logseq.property.journal/title-format "yyyy-MM-dd EEEE"]])
+        [_ page-uuid] (outliner-page/create! conn "Dec 16th, 2024" {})
+        page (d/entity @conn [:block/uuid page-uuid])
+        default-name (-> (:block/journal-day page)
+                         (date-time-util/int->journal-title date-time-util/default-journal-title-formatter)
+                         common-util/page-name-sanity-lc)]
+    (is (= "2024-12-16 Monday" (:block/title page))
+        "Journal title follows configured formatter")
+    (is (= default-name (:block/name page))
+        "Journal block/name remains the default formatter, independent of title format")))
+
+(deftest create-slash-formatted-journal-does-not-create-namespace-pages
+  (let [conn (db-test/create-conn)
+        _ (d/transact! conn [[:db/add :logseq.class/Journal :logseq.property.journal/title-format "yyyy/MM/dd"]])
+        [_ page-uuid] (outliner-page/create! conn "May 18th, 2026" {:split-namespace? true
+                                                                    :journal? true})
+        page (d/entity @conn [:block/uuid page-uuid])]
+    (is (= "2026/05/18" (:block/title page))
+        "Journal title follows slash title format")
+    (is (= (common-uuid/gen-uuid :journal-page-uuid 20260518) (:block/uuid page))
+        "Journal page has the standard journal uuid")
+    (is (nil? (ldb/get-page @conn "2026"))
+        "Journal title is not split into a year namespace page")
+    (is (nil? (ldb/get-page @conn "05"))
+        "Journal title is not split into a month namespace page")
+    (is (nil? (ldb/get-page @conn "18"))
+        "Journal title is not split into a day namespace page")))

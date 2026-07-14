@@ -26,7 +26,7 @@
      * :cardinality - property cardinality. Default to one/single cardinality if not set
      * :hide? - Boolean which hides property when set on a block or exported e.g. slides
      * :public? - Boolean which allows property to be used by user: add and remove property to blocks/pages
-       and queryable via property and has-property rules
+       and queryable via property and has-property rules. When it's not set, it's the same as false
      * :view-context - Keyword to indicate which view contexts a property can be
        seen in when :public? is set. Valid values are :page, :block and :never. Property can
        be viewed in any context if not set
@@ -259,6 +259,11 @@
                                                   :schema {:type :node
                                                            :cardinality :many
                                                            :hide? true}}
+     :logseq.property.comments/blocks {:title "Commented blocks"
+                                        :schema {:type :node
+                                                 :cardinality :many
+                                                 :public? false
+                                                 :hide? true}}
 
      ;; Journal props
      :logseq.property.journal/title-format {:title "Title Format"
@@ -373,6 +378,19 @@
                                         :schema {:type :checkbox
                                                  :hide? true}
                                         :queryable? true}
+     :logseq.property.repeat/repeat-type {:title "Repeating type"
+                                          :schema {:type :default
+                                                   :public? false}
+                                          :closed-values (mapv (fn [[db-ident value]]
+                                                                 {:db-ident db-ident
+                                                                  :value value
+                                                                  :uuid (common-uuid/gen-uuid :db-ident-block-uuid db-ident)})
+                                                               [[:logseq.property.repeat/repeat-type.dotted-plus "Advance from completion"]
+                                                                [:logseq.property.repeat/repeat-type.plus "Advance from scheduled"]
+                                                                [:logseq.property.repeat/repeat-type.double-plus "Advance from scheduled, skip to future"]])
+                                          :properties {:logseq.property/hide-empty-value true
+                                                       :logseq.property/default-value :logseq.property.repeat/repeat-type.double-plus}
+                                          :queryable? true}
      :logseq.property.repeat/temporal-property {:title "Repeating Temporal Property"
                                                 :schema {:type :property
                                                          :hide? true}}
@@ -380,7 +398,16 @@
                                                :schema {:type :property
                                                         :hide? true}}
 
-     ;; TODO: Add more props :Assignee, :Estimate, :Cycle, :Project
+     :logseq.property/assignee {:title "Assignee"
+                                :schema {:type :node
+                                         :cardinality :many
+                                         :public? true
+                                         :ui-position :block-below
+                                         :classes #{:logseq.class/Page}}
+                                :properties {:logseq.property/hide-empty-value true}
+                                :queryable? true}
+
+     ;; TODO: Add more props :Estimate, :Cycle, :Project
 
      :logseq.property/icon {:title "Icon"
                             :schema {:type :map}}
@@ -432,6 +459,41 @@
                                                :public? false
                                                :hide? true}
                                               :queryable? true}
+
+     :logseq.property.view/gallery-asset-property {:title "Gallery asset property"
+                                                   :schema
+                                                   {:type :property
+                                                    :hide? true
+                                                    :public? false}}
+
+     :logseq.property.view/gallery-display-properties {:title "Gallery display properties"
+                                                       :schema
+                                                       {:type :property
+                                                        :cardinality :many
+                                                        :hide? true
+                                                        :public? false}}
+
+     :logseq.property.view/gallery-card-size {:title "Gallery card size"
+                                              :schema
+                                              {:type :keyword
+                                               :hide? true
+                                               :public? false}
+                                              :properties {:logseq.property/scalar-default-value :default}
+                                              :rtc property-ignore-rtc}
+
+     :logseq.property.view/gallery-card-width {:title "Gallery card width"
+                                               :schema
+                                               {:type :raw-number
+                                                :hide? true
+                                                :public? false}
+                                               :rtc property-ignore-rtc}
+
+     :logseq.property.view/gallery-card-height {:title "Gallery card height"
+                                                :schema
+                                                {:type :raw-number
+                                                 :hide? true
+                                                 :public? false}
+                                                :rtc property-ignore-rtc}
 
      :logseq.property.view/sort-groups-by-property {:title "View sort groups by"
                                                     :schema
@@ -620,6 +682,12 @@
                                        :schema {:type :node
                                                 :public? false
                                                 :hide? true}}
+     :logseq.property.agent/session-id {:title "Agent Session ID"
+                                        :schema {:type :string
+                                                 :public? true
+                                                 :hide? true}
+                                        :properties
+                                        {:logseq.property/description "Stores the AgentBridge session ID for a routed task."}}
      :logseq.property/used-template {:title "Used template"
                                      :schema {:type :node
                                               :public? false
@@ -634,6 +702,11 @@
                                                :schema {:type :map
                                                         :public? false
                                                         :hide? true}})))
+
+(def public-built-in-properties
+  (->> built-in-properties
+       (keep (fn [[k v]] (when (get-in v [:schema :public?]) k)))
+       set))
 
 (def db-attribute-properties
   "Internal properties that are also db schema attributes"
@@ -687,7 +760,7 @@
     "logseq.property.journal" "logseq.property.class" "logseq.property.view"
     "logseq.property.user" "logseq.property.history"
     "logseq.property.reaction" "logseq.property.sync" "logseq.property.publish"
-    "logseq.property.recycle"})
+    "logseq.property.recycle" "logseq.property.comments" "logseq.property.agent"})
 
 (defn logseq-property?
   "Determines if keyword is a logseq property"
@@ -740,6 +813,11 @@
   {:pre [(string? s)]}
   ;; Disallow tags or page refs as they would create unreferenceable page names
   (not (re-find #"^(#|\[\[)" s)))
+
+(defn built-in-closed-values
+  "Gets :closed-values for given built-in property ident"
+  [ident]
+  (get-in built-in-properties [ident :closed-values]))
 
 (defn get-closed-property-values
   [db property-id]

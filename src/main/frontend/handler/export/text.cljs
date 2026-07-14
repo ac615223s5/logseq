@@ -9,8 +9,8 @@
             [frontend.state :as state]
             [frontend.util :as util]
             [goog.dom :as gdom]
-            [logseq.cli.common.export.common :as cli-export-common]
-            [logseq.cli.common.export.text :as cli-export-text]
+            [frontend.handler.export.common-impl :as common-impl]
+            [frontend.handler.export.text-impl :as text-impl]
             [logseq.db :as ldb]
             [promesa.core :as p]))
 
@@ -27,26 +27,30 @@
   (util/profile
     :export-blocks-as-markdown
     (try
-      (let [open-blocks-only? (boolean (get-in options [:other-options :open-blocks-only]))
+      (let [remove-options (set (:remove-options options))
+            include-properties? (not (contains? remove-options :property))
+            open-blocks-only? (boolean (get-in options [:other-options :open-blocks-only]))
             content
             (cond
              ;; page
               (and (= 1 (count root-block-uuids-or-page-uuid))
                    (ldb/page? (db/entity [:block/uuid (first root-block-uuids-or-page-uuid)])))
               (common/get-page-content (first root-block-uuids-or-page-uuid)
-                                       {:open-blocks-only? open-blocks-only?})
+                                       {:open-blocks-only? open-blocks-only?
+                                        :include-properties? include-properties?})
               (and (coll? root-block-uuids-or-page-uuid) (every? #(ldb/page? (db/entity [:block/uuid %])) root-block-uuids-or-page-uuid))
               (->> (mapv (fn [id] (:block/title (db/entity [:block/uuid id]))) root-block-uuids-or-page-uuid)
                    (string/join "\n"))
               :else
               (common/root-block-uuids->content repo root-block-uuids-or-page-uuid
-                                                {:open-blocks-only? open-blocks-only?}))
+                                                {:open-blocks-only? open-blocks-only?
+                                                 :include-properties? include-properties?}))
             first-block (and (coll? root-block-uuids-or-page-uuid)
                              (db/entity [:block/uuid (first root-block-uuids-or-page-uuid)]))
             format (get first-block :block/format :markdown)]
-        (binding [cli-export-common/*current-db* (conn/get-db repo)
-                  cli-export-common/*content-config* (common/get-content-config)]
-          (cli-export-text/export-helper content format options)))
+        (binding [common-impl/*current-db* (conn/get-db repo)
+                  common-impl/*content-config* (common/get-content-config)]
+          (text-impl/export-helper content format options)))
       (catch :default e
         (js/console.error e)))))
 
@@ -60,9 +64,9 @@
      (fn [{:keys [path title content]}]
        (util/profile (print-str :export-files-as-markdown title)
          [(or path title)
-          (binding [cli-export-common/*current-db* db
-                    cli-export-common/*content-config* content-config]
-            (cli-export-text/export-helper content :markdown options))]))
+          (binding [common-impl/*current-db* db
+                    common-impl/*content-config* content-config]
+            (text-impl/export-helper content :markdown options))]))
      files)))
 
 (defn export-repo-as-markdown!

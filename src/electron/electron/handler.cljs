@@ -4,7 +4,6 @@
   (:require ["/electron/utils" :as js-utils]
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
-            ["diff-match-patch" :as google-diff]
             ["electron" :refer [app dialog ipcMain shell]]
             ["electron-updater" :refer [autoUpdater]]
             ["electron-window-state" :as windowStateKeeper]
@@ -17,19 +16,25 @@
             [electron.backup-file :as backup-file]
             [electron.configs :as cfgs]
             [electron.db :as db]
+            [electron.db-worker :as db-worker]
+            [electron.embedding-server :as embedding-server]
             [electron.find-in-page :as find]
             [electron.handler-interface :refer [handle]]
             [electron.i18n :as i18n]
             [electron.keychain :as keychain]
             [electron.logger :as logger]
+            [electron.spell-check :as spell-check]
             [electron.plugin :as plugin]
             [electron.server :as server]
             [electron.shell :as shell]
             [electron.state :as state]
             [electron.utils :as utils]
             [electron.window :as win]
-            [logseq.cli.common.graph :as cli-common-graph]
+            [electron.graph-switch-flow :as graph-switch-flow]
+            [logseq.cli.common :as cli-common]
+            [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
+            [logseq.common.graph-registry :as graph-registry]
             [logseq.db.sqlite.util :as sqlite-util]
             [promesa.core :as p]))
 
@@ -63,19 +68,6 @@
       (catch :default e
         (logger/error ::unlink path e)
         nil))))
-
-(defonce Diff (google-diff.))
-(defn string-some-deleted?
-  [old new]
-  (let [result (.diff_main Diff old new)]
-    (some (fn [a] (= -1 (first a))) result)))
-
-(defmethod handle :backupDbFile [_window [_ repo path db-content new-content]]
-  (when (and (string? db-content)
-             (string? new-content)
-             (string-some-deleted? db-content new-content))
-    (logger/info ::backup "backup db file" path)
-    (backup-file/backup-file repo :backup-dir path (node-path/extname path) db-content)))
 
 (defmethod handle :openFileInFolder [_window [_ full-path]]
   (when-let [full-path (utils/to-native-win-path! full-path)]
@@ -118,20 +110,22 @@
       (utils/fs-stat->clj path)
       (catch :default e
         (logger/warn ::write-file path e)
-        (let [backup-path (try
+        (let [error-message (str e)
+              backup-path (try
                             (backup-file/backup-file repo :backup-dir path (node-path/extname path) content)
-                            (catch :default e
-                              (logger/error ::write-file "backup file failed:" e)))]
+                            (catch :default backup-error
+                              (logger/error ::write-file "backup file failed:" backup-error)))]
           (utils/send-to-renderer window "notification"
-                                 (if backup-path
-                                   {:type "error"
-                                    :payload (str "Write to the file " path " failed, " e ". A backup file was saved to " backup-path ".")
-                                    :i18n-key :electron/write-file-error-with-backup
-                                    :i18n-args [path e backup-path]}
-                                   {:type "error"
-                                    :payload (str "Write to the file " path " failed, " e)
-                                    :i18n-key :electron/write-file-error
-                                    :i18n-args [path e]})))))))
+                                  (if backup-path
+                                    {:type "error"
+                                     :payload (str "Write to the file " path " failed, " error-message ". A backup file was saved to " backup-path ".")
+                                     :i18n-key :electron/write-file-error-with-backup
+                                     :i18n-args [path error-message backup-path]}
+                                    {:type "error"
+                                     :payload (str "Write to the file " path " failed, " error-message)
+                                     :i18n-key :electron/write-file-error
+                                     :i18n-args [path error-message]})))))))
+
 (defmethod handle :rename [_window [_ old-path new-path]]
   (logger/info ::rename "from" old-path "to" new-path)
   (fs/renameSync old-path new-path))
@@ -183,12 +177,12 @@
                                 :files (get-files path)}))
         (catch js/Error e
           (do
-            (utils/send-to-renderer window "notification"
-                                   {:type "error"
-                                    :payload (str "Opening the specified directory failed.\n"
-                                                  (or (pretty-print-js-error e) (str "Unexpected error: " e)))
-                                    :i18n-key :electron/open-dir-error
-                                    :i18n-args [(or (pretty-print-js-error e) (str "Unexpected error: " e))]})
+            (let [error-message (or (pretty-print-js-error e) (str "Unexpected error: " e))]
+              (utils/send-to-renderer window "notification"
+                                      {:type "error"
+                                       :payload (str "Opening the specified directory failed.\n" error-message)
+                                       :i18n-key :electron/open-dir-error
+                                       :i18n-args [error-message]}))
             (p/rejected e))))
 
       (p/rejected (js/Error "path empty")))))
@@ -202,35 +196,78 @@
 (defn get-graphs
   "Returns all graph names"
   []
-  (distinct (cli-common-graph/get-db-based-graphs)))
+  (distinct (common-graph/get-db-based-graphs)))
+
+(defn- canonical-repo
+  [graph]
+  (common-config/canonicalize-db-version-repo graph))
 
 ;; TODO support alias mechanism
 (defn get-graph-name
   "Given a graph's name of string, returns the graph's fullname. For example, given
   `cat`, returns `logseq_db_cat`.  Returns `nil` if no such graph exists."
   [graph-identifier]
-  (->> (get-graphs)
-       (some #(when (or
-                     (= (utils/normalize-lc %) (utils/normalize-lc (str sqlite-util/db-version-prefix graph-identifier)))
-                     (string/ends-with? (utils/normalize-lc %)
-                                        (str "/" (utils/normalize-lc graph-identifier))))
-                %))))
+  (or (:repo (graph-registry/resolve-target
+              (cfgs/read-graph-registry)
+              {:graph-identifier graph-identifier}))
+      (when-let [repo (canonical-repo graph-identifier)]
+        (let [graph-name (common-config/strip-leading-db-version-prefix repo)]
+          (->> (get-graphs)
+               (some #(when (or
+                             (= (utils/normalize-lc %) (utils/normalize-lc repo))
+                             (string/ends-with? (utils/normalize-lc %)
+                                                (str "/" (utils/normalize-lc graph-name))))
+                        %)))))))
 
 (defmethod handle :getGraphs [_window [_]]
   (get-graphs))
 
+(defmethod handle :upsertGraphRegistryEntry [_window [_ entry]]
+  (cfgs/upsert-graph-registry-entry! entry))
+
 (defmethod handle :deleteGraph [_window [_ graph]]
-  (when graph
-    (db/unlink-graph! graph)))
+  (when-let [repo (canonical-repo graph)]
+    (p/let [_ (db-worker/release-repo! repo)]
+      (cli-common/unlink-graph! repo))))
 
 ;; DB related IPCs start
 
-(defmethod handle :db-export [_window [_ repo data]]
-  (db/ensure-graph-dir! repo)
-  (db/save-db! repo data))
+(defn stop-all-db-workers!
+  []
+  (db-worker/stop-all-managed!))
+
+(defmethod handle :db-worker-runtime [^js window [_ repo]]
+  (if (string/blank? repo)
+    (p/rejected (ex-info "repo is required" {:code :missing-repo}))
+    (p/let [embedding-endpoint (when (cfgs/semantic-search-enabled?)
+                                 (embedding-server/ensure-endpoint! app))]
+      (db-worker/ensure-runtime! (canonical-repo repo)
+                                 (.-id window)
+                                 (cond-> {}
+                                   embedding-endpoint
+                                   (assoc :embedding-endpoint embedding-endpoint
+                                          :embedding-model-id (.-LOGSEQ_EMBEDDING_MODEL js/process.env)))))))
+
+(defmethod handle :releaseDbWorkerRuntime [^js window [_ repo]]
+  (if (string/blank? repo)
+    (p/rejected (ex-info "repo is required" {:code :missing-repo}))
+    (db-worker/release-runtime! (canonical-repo repo) (.-id window))))
+
+(defmethod handle :db-export [window [_ repo force-backup?]]
+  (when-let [repo (canonical-repo repo)]
+    (db/ensure-graph-dir! repo)
+    (db/backup-db-via-worker! repo (.-id window) {:force-backup? force-backup?})))
+
+(defmethod handle :db-export-as [window [_ repo filename]]
+  (when-let [repo (canonical-repo repo)]
+    (db/export-db-to-export-dir-via-worker! repo (.-id window) filename)))
 
 (defmethod handle :db-get [_window [_ repo]]
-  (db/get-db repo))
+  (when-let [repo (canonical-repo repo)]
+    (logger/warn ::db-get-compat
+                 {:repo repo
+                  :message "legacy db-get IPC path invoked; desktop should use db-worker runtime"})
+    (db/get-db repo)))
 
 ;; DB related IPCs End
 
@@ -251,17 +288,15 @@
    (utils/save-proxy-settings options)))
 
 (defmethod handle :testProxyUrl [_win [_ url options]]
-  ;; FIXME: better not to set proxy while testing url
-  (let [_ (utils/<set-proxy options)
-        start-ms (.getTime (js/Date.))]
-    (-> (utils/fetch url)
+  (let [start-ms (.getTime (js/Date.))]
+    (-> (utils/fetch url {:proxy options})
         (p/timeout 10000)
         (p/then (fn [resp]
                   (let [code (.-status resp)
                         response-ms (- (.getTime (js/Date.)) start-ms)]
                     (if (<= 200 code 299)
-                      #js {:code code
-                           :response-ms response-ms}
+                      {:code code
+                       :response-ms response-ms}
                       (p/rejected (js/Error. (str "HTTP status " code)))))))
         (p/catch (fn [e]
                    (if (instance? p/TimeoutException e)
@@ -289,18 +324,37 @@
 (defmethod handle :quitApp []
   (.quit app))
 
-(defmethod handle :userAppCfgs [_window [_ k v]]
+(defn- enabling-semantic-search?
+  [k v]
+  (and (= k :feature/enable-semantic-search?)
+       (true? v)))
+
+(defmethod handle :userAppCfgs [window [_ k v]]
   (let [config (cfgs/get-config)]
     (if-let [k (and k (keyword k))]
       (if-not (nil? v)
-        (do (cfgs/set-item! k v)
-            (state/set-state! [:config k] v))
+        (p/let [python-available? (if (enabling-semantic-search? k v)
+                                    (embedding-server/python-command-available! "python3")
+                                    true)]
+          (if-not python-available?
+            (p/rejected (ex-info "python3 is required to enable semantic search"
+                                 {:code :missing-python3}))
+            (do (cfgs/set-item! k v)
+                (when (= k :spell-check)
+                  (spell-check/apply-window-spellcheck! window (spell-check/session-spellcheck-enabled? v)))
+                (when (and (= k :feature/enable-semantic-search?)
+                           (false? v))
+                  (embedding-server/stop!))
+                (state/set-state! [:config k] v)
+                nil)))
         (cfgs/get-item k))
       config)))
 
 (defmethod handle :getAppBaseInfo [^js win [_ _opts]]
   {:isFullScreen (.isFullScreen win)
-   :isMaximized (.isMaximized win)})
+   :isMaximized (.isMaximized win)
+   :platform (.-platform js/process)
+   :arch (.-arch js/process)})
 
 (defmethod handle :getAssetsFiles [^js win [_ {:keys [exts]}]]
   (when-let [graph-path (state/get-window-graph-path win)]
@@ -315,8 +369,18 @@
   nil)
 
 (defmethod handle :setCurrentGraph [^js window [_ graph-name]]
-  (when graph-name
-    (set-current-graph! window (utils/get-graph-dir graph-name))))
+  (let [next-graph-path (when graph-name (utils/get-graph-dir graph-name))
+        current-graph-path (state/get-window-graph-path window)
+        release-runtime? (graph-switch-flow/release-runtime-on-set-current-graph?
+                          {:previous-graph-path current-graph-path
+                           :next-graph-path next-graph-path})]
+    (p/let [_ (when release-runtime?
+                (db-worker/release-window! (.-id window)))]
+      (db/sync-auto-backup-repo! (.-id window) graph-name)
+      (if next-graph-path
+        (set-current-graph! window next-graph-path)
+        (state/close-window! window))
+      nil)))
 
 (defmethod handle :updateElectronLocale [_window [_ locale]]
   (i18n/update-locale! locale))
@@ -350,43 +414,81 @@
 
 (def *request-abort-signals (atom {}))
 
+(defn- response-headers->map
+  [^js headers]
+  (let [result (atom {})]
+    (when headers
+      (.forEach headers (fn [value key]
+                          (swap! result assoc key value))))
+    @result))
+
+(defn- request-body->js
+  [payload]
+  (cond
+    (nil? payload) nil
+    (string? payload) payload
+    (instance? js/ArrayBuffer payload) payload
+    (js/ArrayBuffer.isView payload) payload
+    :else (js/JSON.stringify (bean/->js payload))))
+
+(defn- read-response-body
+  [^js res type method]
+  (if (or (= :HEAD method) (contains? #{204 205} (.-status res)))
+    (p/resolved nil)
+    (case type
+      :json
+      (.json res)
+
+      :arraybuffer
+      (.arrayBuffer res)
+
+      :base64
+      (-> (.arrayBuffer res)
+          (p/then #(-> (js/Buffer.from %)
+                       (.toString "base64"))))
+
+      :text
+      (.text res))))
+
 (defmethod handle :httpRequest [_ [_ req-id opts]]
-  (let [{:keys [url abortable method data returnType headers]} opts]
+  (let [{:keys [url abortable method data body returnType headers timeout includeResponse]} opts]
     (when-let [[method type] (and (not (string/blank? url))
                                   [(keyword (string/upper-case (or method "GET")))
                                    (keyword (string/lower-case (or returnType "json")))])]
-      (-> (utils/fetch url
-                       (-> {:method  method
-                            :headers (and headers (bean/->js headers))}
-                           (merge (when (and (not (contains? #{:GET :HEAD} method)) data)
-                                    ;; TODO: support type of arrayBuffer
-                                    {:body (js/JSON.stringify (bean/->js data))})
+      (let [payload (if (some? body) body data)
+            timeout (when (and (number? timeout) (pos? timeout)) timeout)
+            ^js controller (when (or abortable timeout) (AbortController.))
+            timeout-id (when (and timeout controller)
+                         (js/setTimeout #(.abort controller) timeout))]
+        (when controller
+          (swap! *request-abort-signals assoc req-id controller))
+        (-> (utils/fetch url
+                         (-> {:method  method
+                              :headers (and headers (bean/->js headers))}
+                             (merge (when (and (not (contains? #{:GET :HEAD} method)) (some? payload))
+                                      {:body (request-body->js payload)})
 
-                                  (when-let [^js controller (and abortable (AbortController.))]
-                                    (swap! *request-abort-signals assoc req-id controller)
-                                    {:signal (.-signal controller)}))))
-          (p/then (fn [^js res]
-                    (case type
-                      :json
-                      (.json res)
-
-                      :arraybuffer
-                      (.arrayBuffer res)
-
-                      :base64
-                        (-> (.arrayBuffer res)
-                          (p/then #(-> (js/Buffer.from %)
-                                 (.toString "base64"))))
-
-                      :text
-                      (.text res))))
+                                    (when controller
+                                      {:signal (.-signal controller)}))))
+            (p/then (fn [^js res]
+                      (p/let [payload (read-response-body res type method)]
+                        (if includeResponse
+                          {:status (.-status res)
+                           :statusText (.-statusText res)
+                           :ok (.-ok res)
+                           :url (.-url res)
+                           :headers (response-headers->map (.-headers res))
+                           :body payload}
+                          payload))))
           (p/catch
            (fn [^js e]
              ;; TODO: handle special cases
              (throw e)))
           (p/finally
             (fn []
-              (swap! *request-abort-signals dissoc req-id)))))))
+              (when timeout-id
+                (js/clearTimeout timeout-id))
+              (swap! *request-abort-signals dissoc req-id))))))))
 
 (defmethod handle :httpRequestAbort [_ [_ req-id]]
   (when-let [^js controller (get @*request-abort-signals req-id)]
@@ -474,21 +576,37 @@
 (defmethod handle :window/open-blank-callback [^js win [_ _type]]
   (win/setup-window-listeners! win) nil)
 
+(defn- decode-main-ipc-message
+  [args-js]
+  (if (string? args-js)
+    (sqlite-util/read-transit-str args-js)
+    (bean/->clj args-js)))
+
+(defn- command-name
+  [message]
+  (let [command (first message)]
+    (cond
+      (keyword? command) (name command)
+      (string? command) command
+      :else nil)))
+
 (defn set-ipc-handler! [window]
   (let [main-channel "main"]
     (.handle ipcMain main-channel
              (fn [^js event args-js]
-               (try
-                 (let [message (bean/->clj args-js)]
-                   ;; Be careful with the return values of `handle` defmethods.
-                   ;; Values that are not non-JS objects will cause this
-                   ;; exception -
-                   ;; https://www.electronjs.org/docs/latest/breaking-changes#behavior-changed-sending-non-js-objects-over-ipc-now-throws-an-exception
-                   (bean/->js (handle (or (utils/get-win-from-sender event) window) message)))
-                 (catch :default e
-                   (when-not (contains? #{"mkdir" "stat"} (nth args-js 0))
-                     (logger/error "IPC error: " {:event event
-                                                  :args args-js}
-                                   e))
-                   e))))
+               (let [message* (volatile! nil)]
+                 (->
+                  (p/let [message (decode-main-ipc-message args-js)
+                          _ (vreset! message* message)
+                          result (handle (or (utils/get-win-from-sender event) window) message)]
+                    (if (= (some-> message last keyword) :js-obj)
+                      (bean/->js result)
+                      (sqlite-util/write-transit-str result)))
+                  (p/catch (fn [e]
+                             (let [command (command-name @message*)]
+                               (when-not (contains? #{"mkdir" "stat"} command)
+                                 (logger/error "IPC error: " {:event event
+                                                              :args args-js}
+                                               e)
+                                 (throw e)))))))))
     #(.removeHandler ipcMain main-channel)))
