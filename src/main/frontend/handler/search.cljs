@@ -41,7 +41,15 @@
   []
   (when (util/electron?)
     (let [{:keys [active?]} (:ui/find-in-page @state/state)]
-      (when-not active? (state/set-state! [:ui/find-in-page :active?] true)))))
+      (if active?
+        ;; already open: return focus to the input, selecting the existing
+        ;; query so typing replaces it
+        (when-let [^js input (dom/by-id "search-in-page-input")]
+          (dom/remove-style! input :visibility)
+          (dom/set-text! (dom/by-id "search-in-page-placeholder") "")
+          (.focus input)
+          (.select input))
+        (state/set-state! [:ui/find-in-page :active?] true)))))
 
 (defn electron-find-in-page!
   []
