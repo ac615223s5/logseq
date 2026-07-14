@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { ipcRenderer, contextBridge, shell, clipboard, webFrame } = require('electron')
+const { ipcRenderer, contextBridge, shell, clipboard, webFrame, webUtils } = require('electron')
 
 const IS_MAC = process.platform === 'darwin'
 const IS_WIN32 = process.platform === 'win32'
@@ -34,6 +34,8 @@ function getClipboardData (format) {
 }
 
 contextBridge.exposeInMainWorld('apis', {
+  getFilePath: (file) => webUtils.getPathForFile(file),
+
   doAction: async (arg) => {
     return await ipcRenderer.invoke('main', arg)
   },
@@ -133,6 +135,16 @@ contextBridge.exposeInMainWorld('apis', {
    */
   async _callMainWin (type, ...args) {
     return await ipcRenderer.invoke('call-main-win', type, ...args)
+  },
+
+  /**
+   * Write binary data to a file, creating parent dirs as needed.
+   * Used for asset files that can't be transit-serialized through doAction.
+   */
+  writeFileBytes (filePath, data) {
+    const dir = path.dirname(filePath)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(filePath, Buffer.from(data))
   },
 
   getFilePathFromClipboard,

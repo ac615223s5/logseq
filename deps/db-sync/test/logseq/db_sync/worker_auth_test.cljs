@@ -4,6 +4,21 @@
             [logseq.db-sync.worker.auth :as auth]
             [promesa.core :as p]))
 
+(deftest cognito-client-id-allowlist-test
+  (let [env #js {"COGNITO_CLIENT_ID" "web-client"
+                 "COGNITO_CLIENT_IDS" "chatgpt-client, admin-client"}]
+    (is (authorization/client-id-allowed? env "web-client"))
+    (is (authorization/client-id-allowed? env "chatgpt-client"))
+    (is (authorization/client-id-allowed? env "admin-client"))
+    (is (not (authorization/client-id-allowed? env "unknown-client")))))
+
+(deftest cognito-client-id-allowlist-fails-closed-test
+  (is (not (authorization/client-id-allowed? #js {} nil)))
+  (is (not (authorization/client-id-allowed? #js {} "")))
+  (is (not (authorization/client-id-allowed? #js {"COGNITO_CLIENT_ID" ""} "")))
+  (is (not (authorization/client-id-allowed? #js {"COGNITO_CLIENT_IDS" " , "} "chatgpt-client")))
+  (is (not (authorization/client-id-allowed? #js {"COGNITO_CLIENT_ID" "web-client"} nil))))
+
 (deftest auth-claims-uses-jwt-verification-test
   (async done
          (let [request (js/Request. "http://localhost/graphs"
@@ -55,6 +70,22 @@
                          (done)))
                (p/catch (fn [error]
                           (is (= "jwks" (ex-message error)))
+                          (done)))))))
+
+(deftest auth-claims-jwks-error-falls-back-to-unsafe-claims-when-enabled-test
+  (async done
+         (let [token "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1MSJ9.signature"
+               request (js/Request. "http://localhost/graphs"
+                                   #js {:headers #js {"authorization" (str "Bearer " token)}})
+               env #js {"DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" "true"}]
+           (-> (p/with-redefs [authorization/verify-jwt
+                               (fn [_token _env]
+                                 (p/rejected (ex-info "jwks" {})))]
+                 (p/let [claims (auth/auth-claims request env)]
+                   (is (= "u1" (aget claims "sub")))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
                           (done)))))))
 
 (deftest auth-claims-expired-jwt-short-circuits-verification-test

@@ -317,6 +317,68 @@
      (outliner-core/indent-outdent-blocks! (db/get-db test-db false) [(get-block 4) (get-block 5)] false))
     (is (= [3 4 5 6 9] (get-children 2)))))
 
+(deftest test-outdent-skips-comments-right-siblings
+  (testing "
+  [22 [[2 [[3]                  ; outdent 3
+           [4 [[6]]]            ; comments block stays under 2
+           [5]]]]]
+  "
+    (transact-tree! [[22 [[2 [[3]
+                            [4 [[6]]]
+                            [5]]]]]])
+    (d/transact! (db/get-db test-db false)
+                 [{:db/ident :logseq.class/Comments}
+                  [:db/add (:db/id (get-block 4)) :block/tags :logseq.class/Comments]])
+    (outliner-tx/transact!
+     (transact-opts)
+     (outliner-core/indent-outdent-blocks! (db/get-db test-db false) [(get-block 3)] false))
+    (is (= [4] (get-children 2)))
+    (is (= [6] (get-children 4)))
+    (is (= [5] (get-children 3)))))
+
+(deftest test-move-blocks-protects-comments
+  (testing "
+  [22 [[2 [[3]
+           [4 [[6]]]
+           [5]]]]]
+  "
+    (transact-tree! [[22 [[2 [[3]
+                            [4 [[6]]]
+                            [5]]]]]])
+    (d/transact! (db/get-db test-db false)
+                 [{:db/ident :logseq.class/Comments}
+                  [:db/add (:db/id (get-block 4)) :block/tags :logseq.class/Comments]])
+    (testing "comments area cannot be moved as a child"
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/move-blocks! (db/get-db test-db false) [(get-block 4)] (get-block 3) {:sibling? false}))
+      (is (= [3 4 5] (get-children 2)))
+      (is (empty? (get-children 3))))
+    (testing "comments area can be moved as a sibling"
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/move-blocks! (db/get-db test-db false) [(get-block 4)] (get-block 5) {:sibling? true}))
+      (is (= [3 5 4] (get-children 2)))
+      (is (= [6] (get-children 4))))
+    (testing "comment item cannot be moved"
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/move-blocks! (db/get-db test-db false) [(get-block 6)] (get-block 5) {:sibling? false}))
+      (is (= [6] (get-children 4)))
+      (is (empty? (get-children 5))))
+    (testing "ordinary blocks can be moved as siblings of comments"
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/move-blocks! (db/get-db test-db false) [(get-block 3)] (get-block 4) {:sibling? true}))
+      (is (= [5 4 3] (get-children 2)))
+      (is (= [6] (get-children 4))))
+    (testing "ordinary blocks cannot be moved into comments as children"
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/move-blocks! (db/get-db test-db false) [(get-block 5)] (get-block 4) {:sibling? false}))
+      (is (= [5 4 3] (get-children 2)))
+      (is (= [6] (get-children 4))))))
+
 (deftest test-delete-blocks
   (testing "
   [1 [[2 [[3 [[4]
@@ -513,6 +575,58 @@
       (let [children (get-children 25)]
         (is (= 1 (count children)))
         (is (= "child" (:block/title (get-block (first children)))))))))
+
+(deftest test-paste-property-values-into-empty-property-value-block
+  (testing "replace-empty-target remaps pasted property value uuids before adding many-property refs"
+    (transact-tree! [[25]])
+    (db/transact! test-db [{:block/uuid 25
+                            :block/title ""}])
+    (let [conn (db/get-db test-db false)
+          _ (db/transact! test-db [{:db/ident :logseq.property/created-from-property
+                                    :db/valueType :db.type/ref
+                                    :db/cardinality :db.cardinality/one
+                                    :db/index true}])
+          property-ident :user.property/reproduciblesteps
+          _ (db/transact! test-db [{:db/ident property-ident
+                                    :db/valueType :db.type/ref
+                                    :db/cardinality :db.cardinality/many
+                                    :logseq.property/type :default}])
+          property (d/entity @conn property-ident)
+          property-ident (:db/ident property)
+          target-block (get-block 25)
+          _ (db/transact! test-db [{:db/id (:db/id target-block)
+                                    :logseq.property/created-from-property (:db/id property)}
+                                   [:db/add (:db/id (:block/parent target-block))
+                                    property-ident
+                                    (:db/id target-block)]])
+          target-block (get-block 25)
+          _ (is (some? (:logseq.property/created-from-property target-block)))
+          copied-blocks [{:block/uuid 101
+                          :block/title "1"
+                          :block/parent 1}
+                         {:block/uuid 102
+                          :block/title "2"
+                          :block/parent [:block/uuid 101]}
+                         {:block/uuid 103
+                          :block/title "3"
+                          :block/parent 1}]]
+      (outliner-tx/transact!
+       (transact-opts)
+       (outliner-core/insert-blocks! conn
+                                     copied-blocks
+                                     target-block
+                                     {:sibling? true
+                                      :keep-uuid? true
+                                      :outliner-op :paste
+                                      :replace-empty-target? true}))
+      (let [parent (d/entity @conn (:db/id (:block/parent target-block)))
+            values (get parent property-ident)
+            titles (set (map :block/title values))]
+        ;; Old copied uuid should not survive as a dangling property value ref.
+        (is (nil? (get-block 101)))
+        ;; Pasted values should be the replaced target and the new sibling top-level block.
+        (is (= #{"1" "3"} titles))
+        (is (contains? (set (map :db/id values)) (:db/id (get-block 25))))))))
 
 (deftest test-batch-transact
   (testing "add 4, 5 after 2 and delete 3"
@@ -896,3 +1010,20 @@
                :block/parent #:db{:id 2333},
                :block/page #:db{:id 2313},
                :block/level 3}]}]})))))
+
+(deftest non-consecutive-blocks->vec-tree-preserves-worker-pulled-block-fields
+  (let [page-ref #:db{:id 1}
+        parent {:db/id 2
+                :block/uuid #uuid "62f49b4c-f9f0-4739-9985-8bd55e4c68d4"
+                :block/title "Visible parent task"
+                :block/page page-ref
+                :block/parent page-ref}
+        child {:db/id 3
+               :block/uuid #uuid "62f49b4c-aa84-416e-9554-b486b4e59b1b"
+               :block/title "Visible child task"
+               :block/page page-ref
+               :block/parent (select-keys parent [:db/id :block/uuid :block/title])}
+        [result] (tree/non-consecutive-blocks->vec-tree [parent child])]
+    (is (= "Visible parent task" (:block/title result)))
+    (is (= "Visible child task"
+           (:block/title (first (:block/children result)))))))

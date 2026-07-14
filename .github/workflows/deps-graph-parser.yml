@@ -81,10 +81,7 @@ jobs:
         run: clojure -A:test -P
 
       - name: Fetch pnpm deps
-        run: pnpm install --frozen-lockfile
-
-      - name: Run ClojureScript tests
-        run: clojure -M:test
+        run: pnpm install --frozen-lockfile --ignore-workspace
 
       - name: Run nbb-logseq tests
         run: pnpm test

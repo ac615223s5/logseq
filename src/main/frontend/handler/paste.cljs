@@ -22,10 +22,22 @@
             [logseq.graph-parser.block :as gp-block]
             [promesa.core :as p]))
 
+(defn- with-ref-ids
+  [db date-formatter refs]
+  (mapv (fn [ref]
+          (if (and (map? ref)
+                   (:block/title ref)
+                   (nil? (:block/uuid ref)))
+            (gp-block/page-name->map (:block/title ref) db true date-formatter)
+            ref))
+        refs))
+
 (defn- paste-text-parseable
   [format text]
   (when-let [editing-block (state/get-edit-block)]
     (let [page-id (:db/id (:block/page editing-block))
+          current-db (db/get-db (state/get-current-repo))
+          date-formatter (state/get-date-formatter)
           blocks (block/extract-blocks
                   (mldoc/->edn text format)
                   text format
@@ -33,9 +45,14 @@
           blocks' (cond->> (gp-block/with-parent-and-order page-id blocks)
                     true
                     (map (fn [block]
-                           (let [refs (:block/refs block)]
+                           (let [refs (some->> (:block/refs block)
+                                               (with-ref-ids current-db date-formatter))]
                              (-> block
                                  (dissoc :block/tags)
+                                 (cond-> refs
+                                   (assoc :block/refs refs))
+                                 (cond-> (:logseq.property/heading block)
+                                   (update :block/title commands/clear-markdown-heading))
                                  (update :block/title (fn [title]
                                                         (let [title' (db-content/replace-tags-with-id-refs title refs)]
                                                           (db-content/title-ref->id-ref title' refs)))))))))]
@@ -88,9 +105,20 @@
                               (when (contains? (set types) "web application/logseq")
                                 (.getType ^js (first clipboard-items)
                                           "web application/logseq"))))
-          blocks-str (when blocks-blob (.text blocks-blob))]
+          blocks-str (when (and blocks-blob (pos? (.-size blocks-blob)))
+                       (.text blocks-blob))]
     (when blocks-str
       (common-util/safe-read-map-string blocks-str))))
+
+(defn- get-copied-blocks-from-memory
+  [text]
+  (when-let [blocks-str (utils/getCopiedBlocksFromMemory text)]
+    (let [copied-blocks (and (string? blocks-str)
+                             (not (string/blank? blocks-str))
+                             (string/starts-with? (string/triml blocks-str) "{")
+                             (common-util/safe-read-map-string blocks-str))]
+      (when (seq (:blocks copied-blocks))
+        copied-blocks))))
 
 (defn- markdown-blocks?
   [text]
@@ -161,9 +189,11 @@
 (defn- paste-copied-blocks-or-text
   [input text e html]
   (util/stop e)
-  (let [repo (state/get-current-repo)]
+  (let [repo (state/get-current-repo)
+        copied-blocks-from-memory (get-copied-blocks-from-memory text)]
     (->
-     (p/let [{:keys [graph blocks embed-block?]} (get-copied-blocks)]
+     (p/let [{:keys [graph blocks embed-block?]} (or copied-blocks-from-memory
+                                                      (get-copied-blocks))]
        (if (and (seq blocks) (= graph repo))
        ;; Handle internal paste
          (let [revert-cut-txs (get-revert-cut-txs blocks)

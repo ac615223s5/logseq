@@ -1,6 +1,7 @@
 (ns frontend.worker.sync.presence
   "Presence and rtc state helpers for db sync."
-  (:require [logseq.common.util :as common-util]))
+  (:require [logseq.common.util :as common-util]
+            [frontend.worker.state :as worker-state]))
 
 (defn current-client
   [db-sync-client repo]
@@ -16,6 +17,7 @@
   [{:keys [get-datascript-conn
            get-pending-local-tx-count
            get-unpushed-asset-ops-count
+           get-missing-asset-upload-files
            get-local-tx
            get-local-checksum
            get-graph-uuid
@@ -27,6 +29,9 @@
                           (get-pending-local-tx-count repo)
                           0)
           pending-asset (get-unpushed-asset-ops-count repo)
+          missing-asset-upload-files (if get-missing-asset-upload-files
+                                       (get-missing-asset-upload-files repo)
+                                       [])
           local-tx (get-local-tx repo)
           remote-tx (get latest-remote-tx repo)
           local-checksum (when get-local-checksum
@@ -34,15 +39,24 @@
           remote-checksum (get latest-remote-checksum repo)
           pending-server (when (and (number? local-tx) (number? remote-tx))
                            (max 0 (- remote-tx local-tx)))
-          graph-uuid (get-graph-uuid repo)]
-      {:pending-local pending-local
+          graph-uuid (get-graph-uuid repo)
+          client (current-client worker-state/*db-sync-client repo)
+          ws-url (:ws-url @worker-state/*db-sync-config)
+          ws-state (or (some-> client :ws-state deref)
+                       (if (seq ws-url) :stopped :inactive))
+          last-error (some-> client :last-sync-error deref)]
+      {:repo repo
+       :graph-id graph-uuid
+       :pending-local pending-local
        :pending-asset pending-asset
+       :missing-asset-upload-files missing-asset-upload-files
        :pending-server pending-server
        :local-tx local-tx
        :remote-tx remote-tx
        :local-checksum local-checksum
        :remote-checksum remote-checksum
-       :graph-uuid graph-uuid})))
+       :ws-state ws-state
+       :last-error last-error})))
 
 (defn normalize-online-users
   [users]
@@ -61,7 +75,7 @@
   (let [repo (:repo client)
         ws-state @(:ws-state client)
         online-users @(:online-users client)
-        {:keys [pending-local pending-asset pending-server
+        {:keys [pending-local pending-asset missing-asset-upload-files pending-server
                 local-tx remote-tx local-checksum remote-checksum graph-uuid]}
         (sync-counts-f repo)]
     {:rtc-state {:ws-state ws-state}
@@ -69,6 +83,8 @@
      :online-users (or online-users [])
      :unpushed-block-update-count (or pending-local 0)
      :pending-asset-ops-count (or pending-asset 0)
+     :missing-asset-upload-files (or missing-asset-upload-files [])
+     :missing-asset-upload-files-count (count missing-asset-upload-files)
      :pending-server-ops-count (or pending-server 0)
      :local-tx local-tx
      :remote-tx remote-tx

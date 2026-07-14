@@ -11,7 +11,7 @@
             [logseq.publish.model :as publish-model]))
 
 ;; Timestamp in milliseconds used for cache busting static assets.
-(defonce version 1767194868810)
+(defonce version 1779272152856)
 
 (def ref-regex
   (js/RegExp. "\\[\\[([0-9a-fA-F-]{36})\\]\\]|\\(\\(([0-9a-fA-F-]{36})\\)\\)" "g"))
@@ -100,13 +100,19 @@
 (defn- icon-span
   [icon]
   (when (and (map? icon) (string? (:id icon)) (not (string/blank? (:id icon))))
+    (let [icon-type (:type icon)
+          icon-id (:id icon)
+          class-name (str "property-icon"
+                          (when (and (= :tabler-icon icon-type)
+                                     (not (string/blank? icon-id)))
+                            (str " ls-icon-" icon-id)))]
     [:span
      (cond->
-      {:class "property-icon"
+      {:class class-name
        :data-icon-id (:id icon)
        :data-icon-type (name (:type icon))}
        (:color icon)
-       (assoc :style (str "color: " (:color icon) ";")))]))
+       (assoc :style (str "color: " (:color icon) ";")))])))
 
 (defn- with-icon
   [icon nodes]
@@ -255,6 +261,11 @@
   (or (get property-type-by-ident prop-key)
       (get-in db-property/built-in-properties [prop-key :schema :type])))
 
+(defn property-hidden?
+  [prop-key property-hidden-by-ident]
+  (or (true? (get property-hidden-by-ident prop-key))
+      (true? (get-in db-property/built-in-properties [prop-key :schema :hide?]))))
+
 (defn page-ref->uuid [name name->uuid]
   (or (get name->uuid name)
       (get name->uuid (common-util/page-name-sanity-lc name))))
@@ -351,7 +362,7 @@
                 props)
         props (->> props
                    (remove (fn [[k _]]
-                             (true? (get (:property-hidden-by-ident ctx) k))))
+                             (property-hidden? k (:property-hidden-by-ident ctx))))
                    (map (fn [[k v]]
                           (if (= k :block/tags)
                             [k (filter-tags v entities)]
@@ -372,7 +383,7 @@
                           props)]
        [:div.property
         [:dt.property-name (property-title k (:property-title-by-ident ctx))]
-        [:dd.property-value
+        [:dd.property-value {:dir "auto"}
          (into [:span] (normalize-nodes (property-value->nodes v k ctx entities)))]])]))
 
 (defn- property-ui-position
@@ -444,13 +455,13 @@
        (for [[k v] (sorted-properties props ctx)]
          [:div.positioned-property
           [:span.property-name (property-title k (:property-title-by-ident ctx))]
-          [:span.property-value
-           (into [:span] (positioned-value-nodes v k ctx entities))]])]
+          [:span.property-value {:dir "auto"}
+           (into [:span.inline-flex] (positioned-value-nodes v k ctx entities))]])]
 
       [:div {:class (str "positioned-properties " (name position))}
        (for [[k v] (sorted-properties props ctx)]
          [:span.positioned-property
-          (into [:span] (positioned-value-nodes v k ctx entities))])])))
+          (into [:span.inline-flex] (positioned-value-nodes v k ctx entities))])])))
 
 (def ^:private youtube-regex #"^((?:https?:)?//)?((?:www|m).)?((?:youtube.com|youtu.be|y2u.be|youtube-nocookie.com))(/(?:[\w-]+\?v=|embed/|v/)?)([\w-]+)([\S^\?]+)?$")
 (def ^:private vimeo-regex #"^((?:https?:)?//)?((?:www).)?((?:player.vimeo.com|vimeo.com))(/(?:video/)?)([\w-]+)(\S+)?$")
@@ -803,8 +814,7 @@
     :else (str value)))
 
 (defn block-content-nodes [block ctx depth]
-  (let [raw (or (:block/content block)
-                (:block/title block)
+  (let [raw (or (:block/title block)
                 (:block/name block)
                 "")
         heading (heading-level block depth)
@@ -824,11 +834,10 @@
                     block-level? :div.block-text
                     (some macro-embed-node? content) :div.block-text
                     :else :span.block-text)]
-    (into [container] content)))
+    (into [container {:dir "auto"}] content)))
 
 (defn block-raw-content [block]
-  (or (:block/content block)
-      (:block/title block)
+  (or (:block/title block)
       (:block/name block)
       ""))
 
@@ -936,7 +945,7 @@
                     (if (seq ast)
                       (mapcat #(inline->nodes ctx %) ast)
                       (content->nodes raw (:uuid->title ctx) (:graph-uuid ctx)))))]
-    (into [(if block-level? :div.block-text :span.block-text)] content)))
+    (into [(if block-level? :div.block-text :span.block-text) {:dir "auto"}] content)))
 
 (comment
   (def ^:private void-tags

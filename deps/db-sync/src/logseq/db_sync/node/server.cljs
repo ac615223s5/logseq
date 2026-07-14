@@ -24,15 +24,31 @@
 (logging/install!)
 
 (defn- make-env [cfg index-db assets-bucket]
-  (doto (js-obj)
-    (aset "DB" index-db)
-    (aset "LOGSEQ_SYNC_ASSETS" assets-bucket)
-    ;; Node adapter serves snapshot transit stream without gzip to avoid
-    ;; browser/adapter content-encoding mismatches during graph download.
-    (aset "DB_SYNC_SNAPSHOT_STREAM_GZIP" "false")
-    (aset "COGNITO_ISSUER" (:cognito-issuer cfg))
-    (aset "COGNITO_CLIENT_ID" (:cognito-client-id cfg))
-    (aset "COGNITO_JWKS_URL" (:cognito-jwks-url cfg))))
+  (let [allow-unverified-jwt-claims (some-> js/process .-env (aget "DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS"))
+        env (doto (js-obj)
+              (aset "DB" index-db)
+              (aset "LOGSEQ_SYNC_ASSETS" assets-bucket)
+              ;; Node adapter serves snapshot transit stream without gzip to avoid
+              ;; browser/adapter content-encoding mismatches during graph download.
+              (aset "DB_SYNC_SNAPSHOT_STREAM_GZIP" "false")
+              (aset "COGNITO_ISSUER" (:cognito-issuer cfg))
+              (aset "COGNITO_CLIENT_ID" (:cognito-client-id cfg))
+              (aset "COGNITO_JWKS_URL" (:cognito-jwks-url cfg)))]
+    (when (some? allow-unverified-jwt-claims)
+      (aset env "DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" allow-unverified-jwt-claims))
+    env))
+
+(defn- request-origin-opts
+  [cfg]
+  (if-let [base-url (:base-url cfg)]
+    (let [url (js/URL. base-url)
+          protocol (.-protocol url)
+          scheme (if (string/ends-with? protocol ":")
+                   (subs protocol 0 (dec (count protocol)))
+                   protocol)]
+      {:scheme scheme
+       :host (.-host url)})
+    {:scheme "http"}))
 
 (defn- access-allowed?
   [env graph-id request]
@@ -94,9 +110,7 @@
 (defn start!
   [overrides]
   (let [cfg (config/normalize-config overrides)
-        scheme (if (and (:base-url cfg) (string/starts-with? (:base-url cfg) "https"))
-                 "https"
-                 "http")
+        request-origin (request-origin-opts cfg)
         index-db (storage/open-index-db (:data-dir cfg))
         assets-bucket (assets/make-bucket (node-path/join (:data-dir cfg) "assets"))
         registry (atom {})
@@ -109,7 +123,7 @@
                       (graph/delete-graph! registry deps graph-id))))
         server (.createServer http
                               (fn [req res]
-                                (-> (p/let [request (platform-node/request-from-node req {:scheme scheme})
+                                (-> (p/let [request (platform-node/request-from-node req request-origin)
                                             response (dispatch/handle-node-fetch {:request request
                                                                                   :env env
                                                                                   :registry registry
@@ -127,7 +141,7 @@
     (p/let [_ (index/<index-init! index-db)]
       (.on server "upgrade"
            (fn [req ^js socket head]
-             (let [request (platform-node/request-from-node req {:scheme scheme})
+             (let [request (platform-node/request-from-node req request-origin)
                    url (platform/request-url request)
                    path (.-pathname url)
                    parsed (node-routes/parse-sync-path path)

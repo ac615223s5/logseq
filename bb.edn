@@ -41,6 +41,10 @@
   dev:app-watch
   logseq.tasks.dev.mobile/app-watch
 
+  dev:mobile-https-cert
+  {:doc "Generate local HTTPS certificate for mobile Shadow CLJS development"
+   :task logseq.tasks.dev.mobile/ensure-dev-ssl-cert-task}
+
   -dev:build-publishing-frontend
   logseq.tasks.dev/build-publishing-frontend
 
@@ -68,10 +72,6 @@
            (run '-dev:publishing-dev {:parallel true})
            (run '-dev:publishing-release))}
 
-  dev:cli
-  {:doc "Run CLI with current deps/db code. Commands with JS deps are not usable e.g. mcp-server"
-   :task (apply shell {:dir "deps/db"}
-                "pnpm exec nbb-logseq -cp src:../cli/src:../graph-parser/src:../outliner/src -m logseq.cli" *command-line-args*)}
   dev:query
   {:doc "Query a DB graph's datascript db"
    :requires ([babashka.fs :as fs])
@@ -160,6 +160,9 @@
   dev:test
   logseq.tasks.dev/test
 
+  dev:run-test-namespaces
+  logseq.tasks.dev/run-test-namespaces
+
   dev:test-no-worker
   logseq.tasks.dev/test-no-worker
 
@@ -191,6 +194,24 @@
 
   dev:gen-malli-kondo-config
   logseq.tasks.dev/gen-malli-kondo-config
+
+  dev:db-worker-node
+  {:doc "Compile and start db-worker-node (pass-through args forwarded to node)"
+   :task (do
+           (shell "clojure" "-M:cljs" "compile" "db-worker-node")
+           (apply shell "node" "./static/db-worker-node.js" *command-line-args*))}
+
+  dev:cli-e2e
+  {:doc "Run shell-first CLI end-to-end tests"
+   :task (apply shell {:shutdown nil} "bb" "-f" "cli-e2e/bb.edn" "test" *command-line-args*)}
+
+  dev:cli-e2e-cleanup
+  {:doc "Run shell-first CLI end-to-end cleanup"
+   :task (apply shell {:shutdown nil} "bb" "-f" "cli-e2e/bb.edn" "cleanup" *command-line-args*)}
+
+  dev:cli-e2e-sync
+  {:doc "Run shell-first CLI sync end-to-end tests"
+   :task (apply shell {:shutdown nil} "bb" "-f" "cli-e2e/bb.edn" "test-sync" *command-line-args*)}
 
   lint:dev
   logseq.tasks.dev.lint/dev

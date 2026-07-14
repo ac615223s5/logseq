@@ -1,7 +1,7 @@
 (ns frontend.worker.export
   "Export data"
   (:require [datascript.core :as d]
-            [logseq.cli.common.file :as common-file]
+            [logseq.common.export.file :as common-file]
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]))
 
@@ -21,7 +21,7 @@
                                  (not (ldb/journal? entity))
                                  (not (:logseq.property/built-in? entity))
                                  (not (= :logseq.property/query (:db/ident (:logseq.property/created-from-property entity)))))))
-                     (d/datom e a (str "debug " e) t)
+                     (d/datom e a (str "debug " e " " (apply str (repeat (count v) "x"))) t)
 
                      :else
                      (d/datom e a v t))))))

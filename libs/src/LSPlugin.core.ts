@@ -11,6 +11,9 @@ import {
   getSDKPathRoot,
   PROTOCOL_FILE,
   URL_LSP,
+  URL_LSP_EXTERNAL,
+  URL_LSP_HOST,
+  URL_LSP_HOST_EXTERNAL,
   safetyPathJoin,
   path,
   safetyPathNormalize,
@@ -50,6 +53,46 @@ import {
 
 const debug = Debug('LSPlugin:core')
 const DIR_PLUGINS = 'plugins'
+
+/**
+ * Compact one-line diff of two plain-object settings snapshots.
+ * Returns e.g. `foo: 1 -> 2, bar: "x" -> "y", +baz: true, -qux`.
+ * Returns null when no changes are detected.
+ */
+function diffSettings(
+  prev: Record<string, any> | undefined,
+  next: Record<string, any> | undefined
+): string | null {
+  prev = prev || {}
+  next = next || {}
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)])
+  const parts: string[] = []
+  const fmt = (v: any) => {
+    if (v === undefined) return 'undefined'
+    try {
+      const s = JSON.stringify(v)
+      return s && s.length > 80 ? s.slice(0, 77) + '...' : s
+    } catch (_e) { return String(v) }
+  }
+  for (const k of keys) {
+    const a = prev[k], b = next[k]
+    if (a === b) continue
+    if (!(k in prev)) {
+      parts.push(`+${k}: ${fmt(b)}`)
+      continue
+    }
+    if (!(k in next)) {
+      parts.push(`-${k}`)
+      continue
+    }
+    // deep equality fallback via JSON to skip ref-only changes
+    try {
+      if (JSON.stringify(a) === JSON.stringify(b)) continue
+    } catch (_e) { /* fallthrough */ }
+    parts.push(`${k}: ${fmt(a)} -> ${fmt(b)}`)
+  }
+  return parts.length ? parts.join(', ') : null
+}
 
 declare global {
   interface Window {
@@ -411,14 +454,41 @@ function initApiProxyHandlers(pluginLocal: PluginLocal) {
   })
 }
 
-function convertToLSPResource(fullUrl: string, dotPluginRoot: string) {
-  if (dotPluginRoot && fullUrl.startsWith(PROTOCOL_FILE + dotPluginRoot)) {
+function convertToLSPResource(
+  fullUrl: string,
+  localRoot: string,
+  lspRoot = URL_LSP
+) {
+  if (localRoot && fullUrl.startsWith(PROTOCOL_FILE + localRoot)) {
     fullUrl = safetyPathJoin(
-      URL_LSP,
-      fullUrl.substr(PROTOCOL_FILE.length + dotPluginRoot.length)
+      lspRoot,
+      fullUrl.substr(PROTOCOL_FILE.length + localRoot.length)
     )
   }
   return fullUrl
+}
+
+function getPluginLSPRoot(effect?: boolean) {
+  return effect ? URL_LSP_HOST : URL_LSP
+}
+
+function getExternalLSPRoot(localRoot: string, effect?: boolean) {
+  return safetyPathJoin(
+    effect === false ? URL_LSP_EXTERNAL : URL_LSP_HOST_EXTERNAL,
+    encodeURIComponent(localRoot)
+  )
+}
+
+function convertToExternalLSPResource(
+  fullUrl: string,
+  localRoot: string,
+  effect?: boolean
+) {
+  return convertToLSPResource(
+    fullUrl,
+    localRoot,
+    getExternalLSPRoot(localRoot, effect)
+  )
 }
 
 class IllegalPluginPackageError extends Error {
@@ -487,7 +557,12 @@ class PluginLocal extends EventEmitter<
 
   async _setupUserSettings(reload?: boolean) {
     const { _options } = this
-    const logger = (this._logger = new PluginLogger(`Loader:${this.debugTag}`))
+    // Reuse the existing logger to preserve history across reloads;
+    // only update the tag.
+    if (!this._logger) {
+      this._logger = new PluginLogger(`Loader`)
+    }
+    const logger = this._logger
 
     if (_options.settings && !reload && this._disposeSettingsObserver) {
       return
@@ -512,8 +587,9 @@ class PluginLocal extends EventEmitter<
         settings.replace(userSettings)
       }
 
-      const handler = async (a) => {
-        debug('Settings changed', this.debugTag, a)
+      const handler = async (a, b) => {
+        const changed = diffSettings(b, a)
+        if (changed) logger.debug('settings changed', changed)
 
         if (a) {
           invokeHostExportedApi('save_plugin_user_settings', this.id, a)
@@ -533,7 +609,7 @@ class PluginLocal extends EventEmitter<
       this._disposeSettingsObserver = disposeSettingsObserver
     } catch (e) {
       debug('[load plugin user settings Error]', e)
-      logger?.error(e)
+      logger?.error('load user settings failed', e)
     }
   }
 
@@ -564,9 +640,19 @@ class PluginLocal extends EventEmitter<
       const url = path.join(localRoot, filePath)
       filePath = reg.test(url) ? url : PROTOCOL_FILE + url
     }
-    return !this.options.effect && this.isInstalledInLocalDotRoot
-      ? convertToLSPResource(filePath, this.dotPluginsRoot)
-      : filePath
+    if (this.isInstalledInLocalDotRoot) {
+      return convertToLSPResource(
+        filePath,
+        this.dotPluginsRoot,
+        getPluginLSPRoot(this.options.effect)
+      )
+    }
+
+    return convertToExternalLSPResource(
+      filePath,
+      localRoot,
+      this.options.effect
+    )
   }
 
   async _preparePackageConfigs() {
@@ -580,6 +666,7 @@ class PluginLocal extends EventEmitter<
         packageConfigError = 'Can not resolve package config location'
       } else {
         debug('prepare package root', url)
+        this._logger?.debug('prepare package root', url)
 
         try {
           pkg = await invokeHostExportedApi('load_plugin_config', url)
@@ -635,7 +722,7 @@ class PluginLocal extends EventEmitter<
     if (logseq.devEntry) {
       // development mode entry
       this._options.devEntry = logseq.devEntry
-      this._options.entry = logseq.devEntry
+      this._options.entry = this._resolveResourceFullUrl(logseq.devEntry, localRoot)
     } else {
       // theme has no main
       this._options.entry = this._resolveResourceFullUrl(entry, localRoot)
@@ -667,6 +754,7 @@ class PluginLocal extends EventEmitter<
           })
         } catch (e) {
           debug('[save plugin ID Error] ', e)
+          this._logger?.warn('save plugin id failed', e)
         }
       }
     }
@@ -689,6 +777,7 @@ class PluginLocal extends EventEmitter<
         }
       } catch (e) {
         debug('[prepare package effect Error]', e)
+        this._logger?.error('prepare package effect failed', e)
       }
     }
   }
@@ -698,7 +787,10 @@ class PluginLocal extends EventEmitter<
     devEntry = devEntry || settings?.get('_devEntry')
 
     if (devEntry) {
-      this._options.entry = devEntry
+      this._options.entry = this._resolveResourceFullUrl(
+        devEntry,
+        this._localRoot
+      )
       return
     }
 
@@ -724,7 +816,7 @@ class PluginLocal extends EventEmitter<
     ${
         this.isWebPlugin
           ? `<script src="https://cdn.jsdelivr.net/npm/@logseq/libs/dist/lsplugin.user.min.js?v=${tag}"></script>`
-          : `<script src="${sdkPathRoot}/lsplugin.user.js?v=${tag}"></script>`
+          : `<script src="/external/${sdkPathRoot}/lsplugin.user.js?v=${tag}"></script>`
       }
 
   </head>
@@ -736,10 +828,21 @@ class PluginLocal extends EventEmitter<
       dirPathInstalled
     )
 
-    entry = convertToLSPResource(
-      withFileProtocol(path.normalize(entryPath)),
-      this.dotPluginsRoot
-    )
+    entry = withFileProtocol(path.normalize(entryPath))
+
+    if (this.isInstalledInLocalDotRoot) {
+      entry = convertToLSPResource(
+        entry,
+        this.dotPluginsRoot,
+        getPluginLSPRoot(this.options.effect)
+      )
+    } else {
+      entry = convertToExternalLSPResource(
+        entry,
+        path.dirname(entryPath),
+        this.options.effect
+      )
+    }
 
     this._options.entry = entry
   }
@@ -901,8 +1004,13 @@ class PluginLocal extends EventEmitter<
     }>
   ) {
     if (this.pending || this.loaded) {
+      this._logger?.debug('load skipped',
+        this.pending ? '(pending)' : '(already loaded)')
       return
     }
+
+    const t0 = performance.now()
+    this._logger?.info('load:start', opts?.reload ? '(reload)' : '')
 
     this._transitionStatus(PluginLocalLoadStatus.LOADING, [
       PluginLocalLoadStatus.UNLOADED,
@@ -922,16 +1030,23 @@ class PluginLocal extends EventEmitter<
         await installPackageThemes.call(null)
       }
 
-      if (this.disabled || !this.options.entry) {
+      if (this.disabled) {
+        this._logger?.info('load:skip (disabled)')
+        return
+      }
+      if (!this.options.entry) {
+        this._logger?.info('load:skip (no entry - theme-only package)')
         return
       }
 
       this._ctx.emit('beforeload', this)
 
       await this._tryToNormalizeEntry()
+      this._logger?.debug('entry normalized', this.options.entry)
 
       this._caller = new LSPluginCaller(this)
       await this._caller.connectToChild()
+      this._logger?.debug('sandbox connected')
 
       const readyFn = () => {
         this._caller?.callUserModel(LSPMSG_READY, { pid: this.id })
@@ -950,8 +1065,10 @@ class PluginLocal extends EventEmitter<
       this._dispose(cleanInjectedScripts.bind(this))
 
       this._ctx.emit('loadeded', this)
+      this._logger?.info(
+        `load:done in ${(performance.now() - t0).toFixed(1)}ms`)
     } catch (e) {
-      this.logger.error('load', e, true)
+      this.logger.error('load:failed', e, true)
 
       this.disposeRuntime().catch(null)
       this._status = PluginLocalLoadStatus.ERROR
@@ -970,9 +1087,11 @@ class PluginLocal extends EventEmitter<
 
   async reload() {
     if (this.pending) {
+      this._logger?.debug('reload skipped (pending)')
       return
     }
 
+    this._logger?.info('reload:start')
     this._ctx.emit('beforereload', this)
 
     if (this.loaded) {
@@ -981,6 +1100,7 @@ class PluginLocal extends EventEmitter<
 
     await this.load({ reload: true })
     this._ctx.emit('reloaded', this)
+    this._logger?.info('reload:done')
   }
 
   /**
@@ -988,6 +1108,7 @@ class PluginLocal extends EventEmitter<
    */
   async unload(unregister: boolean = false) {
     if (this.pending) {
+      this._logger?.debug('unload skipped (pending)')
       return
     }
 
@@ -997,6 +1118,7 @@ class PluginLocal extends EventEmitter<
     }
 
     if (unregister) {
+      this._logger?.info('unregister:start')
       await this.unload()
       await this.disposeRegistration()
 
@@ -1004,9 +1126,11 @@ class PluginLocal extends EventEmitter<
         this._ctx.emit('unlink-plugin', this.id)
       }
 
+      this._logger?.info('unregister:done')
       return
     }
 
+    this._logger?.info('unload:start')
     try {
       const eventBeforeUnload = { unregister }
 
@@ -1022,15 +1146,16 @@ class PluginLocal extends EventEmitter<
           )
           this.emit('beforeunload', eventBeforeUnload)
         } catch (e) {
-          this.logger.error('beforeunload', e)
+          this.logger.error('beforeunload hook failed', e)
         }
 
         await this.disposeRuntime()
       }
 
       this.emit('unloaded')
+      this._logger?.info('unload:done')
     } catch (e) {
-      this.logger.error('unload', e)
+      this.logger.error('unload failed', e)
     } finally {
       this._status = PluginLocalLoadStatus.UNLOADED
     }
@@ -1041,7 +1166,7 @@ class PluginLocal extends EventEmitter<
       try {
         fn && (await fn())
       } catch (e) {
-        console.error(this.debugTag, 'dispose Error', e)
+        this._logger?.error('dispose failed', e)
       }
     }
   }
@@ -1437,6 +1562,7 @@ class LSPluginCore
 
         if (loadErr) {
           debug('[Failed LOAD Plugin] #', pluginOptions)
+          pluginLocal.logger?.error('register: load failed', loadErr, true)
 
           this.emit('error', loadErr)
 
@@ -1497,6 +1623,10 @@ class LSPluginCore
         const p = this.ensurePlugin(identity)
         await p.reload()
       } catch (e) {
+        try {
+          this.getPluginLogger(identity)
+            ?.error('reload failed', e)
+        } catch (_) { /* unknown plugin */ }
         debug(e)
       }
     }
@@ -1538,12 +1668,14 @@ class LSPluginCore
     if (p.pending) return
     if (!p.disabled && p.loaded) return
 
+    p.logger?.info('enable:start')
     this.emit('beforeenable')
     p.settings?.set('disabled', false)
 
     await p.load()
 
     this.emit('enabled', p.id)
+    p.logger?.info('enable:done')
   }
 
   async disable(plugin: PluginLocalIdentity) {
@@ -1551,12 +1683,14 @@ class LSPluginCore
     if (p.pending) return
     if (p.disabled && !p.loaded) return
 
+    p.logger?.info('disable:start')
     this.emit('beforedisable')
     p.settings?.set('disabled', true)
 
     await p.unload()
 
     this.emit('disabled', p.id)
+    p.logger?.info('disable:done')
   }
 
   async _hook(ns: string, type: string, payload?: any, pid?: string) {
@@ -1637,6 +1771,28 @@ class LSPluginCore
     return p
   }
 
+  /**
+   * Return the {@link PluginLogger} of the given plugin (if any).
+   * Returns undefined when the plugin is unknown.
+   */
+  getPluginLogger(id: PluginLocalIdentity) {
+    try {
+      return this.ensurePlugin(id)?.logger
+    } catch (_e) {
+      return undefined
+    }
+  }
+
+  /** Return structured log entries for the given plugin. */
+  getPluginLogs(id: PluginLocalIdentity) {
+    return this.getPluginLogger(id)?.getEntries() || []
+  }
+
+  /** Clear log entries for the given plugin. */
+  clearPluginLogs(id: PluginLocalIdentity) {
+    this.getPluginLogger(id)?.clear()
+  }
+
   hostMounted() {
     this._hostMountedActor.resolve()
   }
@@ -1695,6 +1851,8 @@ class LSPluginCore
 
     themes.push(opt)
     this.emit('themes-changed', this.themes, { id, ...opt })
+    this.getPluginLogger(id)
+      ?.debug('theme registered', opt?.name || (opt as any)?.url || '')
   }
 
   async selectTheme(
