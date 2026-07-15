@@ -59,7 +59,10 @@
                      (merge opts)
 
                      linux?
-                     (assoc :icon (node-path/join js/__dirname "icons/logseq.png")))
+                     (assoc :icon (node-path/join js/__dirname "icons/logseq.png"))
+
+                     win32?
+                     (assoc :icon (node-path/join js/__dirname "icons/logseq.ico")))
          win       (BrowserWindow. (clj->js win-opts))
          spell-check-enabled? (spell-check/session-spellcheck-enabled? (cfgs/get-item :spell-check))]
      (spell-check/apply-window-spellcheck! win spell-check-enabled?)
