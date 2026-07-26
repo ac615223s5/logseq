@@ -1,6 +1,13 @@
 appId: com.logseq.logseq
 electronUpdaterCompatibility: ">=2.16"
 
+# Keep the window/taskbar icon as a real file on disk. BrowserWindow won't
+# load a taskbar icon from inside app.asar, so window.cljs' :icon path only
+# works when these are unpacked to app.asar.unpacked.
+asarUnpack:
+  - "icons/logseq.ico"
+  - "icons/logseq.png"
+
 directories:
   buildResources: .
   output: dist
