@@ -42,6 +42,35 @@
         (let [block-entity (d/entity @conn [:block/uuid target-uuid])]
           (is (empty? (:logseq.property.reaction/_target block-entity))))))))
 
+(deftest cycle-todos-op
+  (testing "cycles and toggles task status via outliner ops"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "Test"}
+                  :blocks [{:block/title "Task block"}]}])
+          block (db-test/find-block-by-content @conn "Task block")
+          block-uuid (:block/uuid block)
+          ;; d/pull instead of entity lookup to avoid the property
+          ;; default-value fallback masking a removed status
+          status-ident (fn []
+                         (some-> (d/pull @conn [{:logseq.property/status [:db/ident]}]
+                                         [:block/uuid block-uuid])
+                                 :logseq.property/status :db/ident))
+          cycle! #(outliner-op/apply-ops! conn [[:cycle-todos [[block-uuid] %]]] {})]
+      (cycle! :cycle)
+      (is (= :logseq.property/status.todo (status-ident)))
+      (cycle! :cycle)
+      (is (= :logseq.property/status.doing (status-ident)))
+      (cycle! :cycle)
+      (is (= :logseq.property/status.done (status-ident)))
+      (cycle! :cycle)
+      (is (nil? (status-ident)))
+      (cycle! :toggle-done)
+      (is (= :logseq.property/status.done (status-ident)))
+      (cycle! :toggle-done)
+      (is (= :logseq.property/status.todo (status-ident)))
+      (cycle! :toggle-done)
+      (is (= :logseq.property/status.done (status-ident))))))
+
 (deftest apply-ops-plugin-property-sequence-test
   (testing "plugin property ops remain visible after a single apply-ops! batch"
     (let [conn (db-test/create-conn-with-blocks
