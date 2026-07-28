@@ -80,7 +80,7 @@
 (hsx/defc sync-key-form
   []
   (let [[server set-server!] (hooks/use-state (or (config/get-custom-sync-server-url)
-                                                  "http://192.168.88.9:8787"))
+                                                  "http://192.168.2.14:8787"))
         [passphrase set-passphrase!] (hooks/use-state "")
         [busy? set-busy!] (hooks/use-state false)
         submit!
@@ -117,7 +117,7 @@
       (shui/input
        {:id "sync-server-url"
         :value server
-        :placeholder "http://192.168.88.9:8787"
+        :placeholder "http://192.168.2.14:8787"
         :on-change (fn [^js e] (set-server! (.. e -target -value)))})]
      [:div.flex.flex-col.gap-1
       [:label.text-sm.opacity-70 {:for "sync-passphrase"} "Passphrase"]
