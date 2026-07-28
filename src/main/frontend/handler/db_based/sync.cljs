@@ -1,6 +1,7 @@
 (ns frontend.handler.db-based.sync
   "DB-sync handler based on Cloudflare Durable Objects."
   (:require [clojure.string :as string]
+            [frontend.common.sync-key :as sync-key]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
@@ -196,13 +197,55 @@
     (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
 
     (seq config/COGNITO-CLIENT-ID)
-    (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID)))
+    (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID)
 
-(defn- <sync-auth-state-to-db-worker!
+    ;; Let the worker re-mint self-signed tokens instead of hitting Cognito.
+    (user-handler/sync-key-mode?)
+    (assoc :auth/sync-key? true)))
+
+(defn <sync-auth-state-to-db-worker!
+  "Push auth state (tokens, and in sync-key mode the passphrase + :auth/sync-key?)
+   to the db worker and await it. Awaitable, unlike the fire-and-forget
+   [:rtc/sync-app-state] event."
   []
   (p/let [_ (js/Promise. user-handler/task--ensure-id&access-token)
           payload (sync-app-state-payload)]
     (state/<invoke-db-worker :thread-api/sync-app-state payload)))
+
+(defn <ensure-sync-key-e2ee!
+  "In sync-key mode, if the db worker is already running (i.e. a graph is open),
+   push auth + config and ensure the user's RSA keys exist on the server. On a
+   fresh desktop app with no graph open the worker isn't started, so this is a
+   no-op — E2EE keys are then uploaded lazily when a graph is created/synced
+   (the worker derives the password from the passphrase; see
+   frontend.worker.sync.crypt/sync-key-e2ee-password)."
+  []
+  (if (and (user-handler/sync-key-mode?) @state/*db-worker)
+    (let [{:keys [e2ee-password]} (sync-key/derive (user-handler/stored-sync-key))]
+      (-> (p/do!
+           (<sync-auth-state-to-db-worker!)
+           (state/<invoke-db-worker :thread-api/set-db-sync-config
+                                    {:enabled? true
+                                     :ws-url (config/db-sync-ws-url)
+                                     :http-base (config/db-sync-http-base)})
+           (state/<invoke-db-worker :thread-api/db-sync-ensure-user-rsa-keys
+                                    {:password e2ee-password})
+           nil)
+          (p/catch (fn [error]
+                     (log/error :db-sync/ensure-sync-key-e2ee-failed error)
+                     nil))))
+    (p/resolved nil)))
+
+(defn <login-with-sync-key!
+  "Account-less login for a self-hosted sync server. `passphrase` derives the
+   identity, the HMAC key, and the E2EE password; `server-url` is the sync
+   server base (e.g. http://192.168.2.14:8787). The E2EE + graph bootstrap runs
+   via the :user/fetch-info-and-graphs handler (same path as restore)."
+  [passphrase server-url]
+  (config/set-custom-sync-server-url! server-url)
+  (user-handler/set-sync-key-tokens! passphrase)
+  (state/pub-event! [:user/fetch-info-and-graphs])
+  (p/resolved nil))
 
 (defn <rtc-start!
   [repo & {:keys [_stop-before-start?] :as _opts}]
@@ -265,8 +308,12 @@
   ([repo graph-e2ee?]
    (<rtc-create-graph! repo graph-e2ee? true))
   ([repo graph-e2ee? graph-ready-for-use?]
-   (state/<invoke-db-worker :thread-api/db-sync-create-remote-graph
-                            repo graph-e2ee? graph-ready-for-use?)))
+   ;; The new graph runs in its own freshly-spawned daemon with no auth state;
+   ;; push auth to it before creating the remote graph (esp. account-less, where
+   ;; there is no auth.json fallback).
+   (p/let [_ (<sync-auth-state-to-db-worker!)]
+     (state/<invoke-db-worker :thread-api/db-sync-create-remote-graph
+                              repo graph-e2ee? graph-ready-for-use?))))
 
 (defn <rtc-delete-graph!
   [graph-uuid _schema-version]

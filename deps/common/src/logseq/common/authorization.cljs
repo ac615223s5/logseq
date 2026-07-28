@@ -96,6 +96,43 @@
               false
               #js ["verify"]))
 
+(defn- import-hmac-key [key-bytes]
+  (.importKey js/crypto.subtle
+              "raw"
+              key-bytes
+              #js {:name "HMAC" :hash "SHA-256"}
+              false
+              #js ["verify"]))
+
+(defn verify-hs256
+  "Verify a self-signed HS256 JWT against a base64url-encoded shared key.
+   Used for account-less self-hosted sync (DB_SYNC_SHARED_KEY). Returns the
+   decoded payload on success, throws otherwise. iss/aud are not checked here —
+   possession of the shared key is the authorization."
+  [token shared-key-b64url]
+  (let [parts (string/split token #"\.")]
+    (when (not= 3 (count parts)) (throw (ex-info "invalid" {})))
+    (let [header-part (nth parts 0)
+          payload-part (nth parts 1)
+          signature-part (nth parts 2)
+          now-s (js/Math.floor (/ (get-now-ms) 1000))]
+      (if-let [cached (cached-token token now-s (get-now-ms))]
+        (p/resolved cached)
+        (p/let [header (decode-jwt-part header-part)
+                payload (decode-jwt-part payload-part)
+                _ (when (not= "HS256" (aget header "alg")) (throw (ex-info "invalid" {})))
+                _ (when (and (aget payload "exp") (< (aget payload "exp") now-s))
+                    (throw (ex-info "exp" {})))
+                key-bytes (base64url->uint8array shared-key-b64url)
+                crypto-key (import-hmac-key key-bytes)
+                data (.encode text-encoder (str header-part "." payload-part))
+                signature (base64url->uint8array signature-part)
+                ok (.verify js/crypto.subtle #js {:name "HMAC"} crypto-key signature data)]
+          (if ok
+            (do (cache-token! token payload (get-now-ms))
+                payload)
+            (throw (ex-info "invalid" {}))))))))
+
 (defn verify-jwt [token env]
   (let [parts (string/split token #"\.")]
     (when (not= 3 (count parts)) (throw (ex-info "invalid" {})))

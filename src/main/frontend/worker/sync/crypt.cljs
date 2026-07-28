@@ -2,6 +2,7 @@
   "E2EE helpers for db-sync."
   (:require [clojure.string :as string]
             [frontend.common.crypt :as crypt]
+            [frontend.common.sync-key :as sync-key]
             [frontend.common.thread-api :refer [def-thread-api]]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.platform :as platform]
@@ -361,24 +362,47 @@
                                            :field :encrypted-private-key}))
       (<verify-and-save-e2ee-password! password encrypted-private-key))))
 
+(defn sync-key-mode?
+  "True when authenticated with a self-hosted passphrase (detected from the
+   id-token's issuer, which is present whenever E2EE runs)."
+  []
+  (= sync-key/issuer
+     (some-> (:auth/id-token @worker-state/*state) worker-util/parse-jwt :iss)))
+
+(defn sync-key-e2ee-password
+  "Account-less sync-key mode: the passphrase is propagated to the worker as
+   :auth/refresh-token. Derive the E2EE password from it so E2EE needs no
+   separate password prompt or OS secret store (single-passphrase UX)."
+  []
+  (when (sync-key-mode?)
+    (when-let [pass (:auth/refresh-token @worker-state/*state)]
+      (when (seq pass)
+        (:e2ee-password (sync-key/derive pass))))))
+
 (defn- <generate-and-upload-user-rsa-key-pair!
   [base {:keys [password]}]
   (p/let [{:keys [publicKey privateKey]} (crypt/<generate-rsa-key-pair)
-          password (cond
-                     (and (string? password) (seq password))
-                     password
+          password (or
+                    (sync-key-e2ee-password)
+                    (cond
+                      (and (string? password) (seq password))
+                      password
 
-                     (interactive-runtime?)
-                     (<request-e2ee-password-from-ui {:reason :generate-user-rsa-key-pair})
+                      (interactive-runtime?)
+                      (<request-e2ee-password-from-ui {:reason :generate-user-rsa-key-pair})
 
-                     :else
-                     (fail-missing-e2ee-password! {:reason :missing-password-for-generate-user-rsa-key-pair
-                                                   :hint "Provide --e2ee-password when running sync ensure-keys --upload-keys."}))
+                      :else
+                      (fail-missing-e2ee-password! {:reason :missing-password-for-generate-user-rsa-key-pair
+                                                    :hint "Provide --e2ee-password when running sync ensure-keys --upload-keys."})))
           encrypted-private-key (crypt/<encrypt-private-key password privateKey)
           exported-public-key (crypt/<export-public-key publicKey)
           public-key-str (ldb/write-transit-str exported-public-key)
           encrypted-private-key-str (ldb/write-transit-str encrypted-private-key)]
-    (p/let [_ (<save-e2ee-password password)
+    (p/let [;; In sync-key mode the password is always re-derivable from the
+            ;; passphrase, so skip persisting it — and avoid <save-e2ee-password's
+            ;; node path that reads a refresh-token from ~/logseq/auth.json (absent
+            ;; account-less) and throws :missing-refresh-token.
+            _ (when-not (sync-key-mode?) (<save-e2ee-password password))
             _ (<upload-user-rsa-key-pair! base public-key-str encrypted-private-key-str)]
       {:public-key public-key-str
        :encrypted-private-key encrypted-private-key-str
@@ -455,7 +479,10 @@
                 (p/rejected (missing-e2ee-password-ex {:reason :missing-persisted-password
                                                        :hint "Provide --e2ee-password to persist it."}))))))]
     (p/let [encrypted-private-key (ldb/read-transit-str encrypted-private-key-str)]
-      (-> (<decrypt-in-headless encrypted-private-key)
+      (if-let [sk-pass (sync-key-e2ee-password)]
+        ;; Account-less mode: decrypt directly with the passphrase-derived password.
+        (crypt/<decrypt-private-key sk-pass encrypted-private-key)
+        (-> (<decrypt-in-headless encrypted-private-key)
           (p/catch (fn [headless-error]
                      (if-not (interactive-runtime?)
                        (p/rejected headless-error)
@@ -463,7 +490,7 @@
                            (p/catch (fn [ui-error]
                                       (if (missing-persisted-password-error? headless-error)
                                         (p/rejected ui-error)
-                                        (p/rejected headless-error))))))))))))
+                                        (p/rejected headless-error)))))))))))))
 
 (defn- <import-public-key
   [public-key-str]

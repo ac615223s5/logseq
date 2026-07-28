@@ -443,29 +443,42 @@
                    nil)))
     (p/resolved nil)))
 
+(defn- fetch-remote-graphs-and-maybe-start!
+  []
+  (async/go
+    (async/<! (p->c (rtc-handler/<get-remote-graphs)))
+    (repo-handler/refresh-repos!)
+    (when-let [current-repo (state/get-current-repo)]
+      (when (some #(= current-repo (:url %)) (state/get-rtc-graphs))
+        (rtc-flows/trigger-rtc-start current-repo)))))
+
 (defmethod events/handle :user/fetch-info-and-graphs [[_]]
   (state/set-state! [:ui/loading? :login] false)
-  (async/go
-    (let [result (async/<! (user-handler/<user-info user-handler/remoteapi))]
-      (cond
-        (instance? ExceptionInfo result)
-        nil
-        (map? result)
-        (do
-          (state/set-user-info! result)
-          (when-let [uid (user-handler/user-uuid)]
-            (sentry-event/set-user! uid)
-            (ensure-user-rsa-keys-if-possible!))
-          (let [status (if (user-handler/alpha-or-beta-user?) :welcome :unavailable)
-                fetch-graphs? (and (user-handler/logged-in?)
-                                   (or (= status :welcome)
-                                       (user-handler/rtc-group?)))]
-            (when fetch-graphs?
-              (async/<! (p->c (rtc-handler/<get-remote-graphs)))
-              (repo-handler/refresh-repos!)
-              (when-let [current-repo (state/get-current-repo)]
-                (when (some #(= current-repo (:url %)) (state/get-rtc-graphs))
-                  (rtc-flows/trigger-rtc-start current-repo))))))))))
+  (if (user-handler/sync-key-mode?)
+    ;; Account-less self-hosted sync: no central user-info endpoint. Ensure the
+    ;; E2EE keys exist and pull the graph list straight from the sync server.
+    (async/go
+      (when-let [uid (user-handler/user-uuid)]
+        (sentry-event/set-user! uid))
+      (async/<! (p->c (rtc-handler/<ensure-sync-key-e2ee!)))
+      (async/<! (fetch-remote-graphs-and-maybe-start!)))
+    (async/go
+      (let [result (async/<! (user-handler/<user-info user-handler/remoteapi))]
+        (cond
+          (instance? ExceptionInfo result)
+          nil
+          (map? result)
+          (do
+            (state/set-user-info! result)
+            (when-let [uid (user-handler/user-uuid)]
+              (sentry-event/set-user! uid)
+              (ensure-user-rsa-keys-if-possible!))
+            (let [status (if (user-handler/alpha-or-beta-user?) :welcome :unavailable)
+                  fetch-graphs? (and (user-handler/logged-in?)
+                                     (or (= status :welcome)
+                                         (user-handler/rtc-group?)))]
+              (when fetch-graphs?
+                (async/<! (fetch-remote-graphs-and-maybe-start!))))))))))
 
 (defmethod events/handle :dialog/show-block [[_ block option]]
   (shui/dialog-open!

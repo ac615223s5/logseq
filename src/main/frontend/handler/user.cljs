@@ -9,6 +9,7 @@
             [clojure.string :as string]
             [electron.ipc :as ipc]
             [frontend.common.missionary :as c.m]
+            [frontend.common.sync-key :as sync-key]
             [frontend.common.thread-api :refer [def-thread-api]]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
@@ -86,6 +87,35 @@
    (state/get-auth-id-token)
    parse-jwt
    :sub))
+
+;;; Account-less self-hosted sync: authenticate with a single passphrase instead
+;;; of a Logseq account. See frontend.common.sync-key.
+
+(def ^:private sync-key-mode-ls "logseq-sync-key-mode")
+(def ^:private sync-key-ls "logseq-sync-key")
+
+(defn sync-key-mode?
+  "True when the user has logged in with a self-hosted sync passphrase."
+  []
+  (and (not util/node-test?)
+       (= "1" (js/localStorage.getItem sync-key-mode-ls))))
+
+(defn stored-sync-key
+  []
+  (when (and (not util/node-test?) (sync-key-mode?))
+    (let [k (js/localStorage.getItem sync-key-ls)]
+      (when (and (string? k) (not (string/blank? k))) k))))
+
+(defn- mint-sync-token
+  []
+  (when-let [passphrase (stored-sync-key)]
+    (sync-key/mint-token passphrase (js/Date.now))))
+
+(defn clear-sync-key!
+  []
+  (when-not util/node-test?
+    (js/localStorage.removeItem sync-key-mode-ls)
+    (js/localStorage.removeItem sync-key-ls)))
 
 (defn logged-in? []
   (let [token (state/get-auth-refresh-token)]
@@ -184,6 +214,17 @@
    (some->> (parse-jwt (state/get-auth-id-token))
             (reset! flows/*current-login-user))))
 
+(defn set-sync-key-tokens!
+  "Enter sync-key mode: persist the passphrase and mint a self-signed token that
+   the sync plumbing treats like a normal id/access token. `refresh-token` is set
+   to the passphrase so the worker can re-mint and the E2EE store stays stable."
+  [passphrase]
+  (js/localStorage.setItem sync-key-mode-ls "1")
+  (js/localStorage.setItem sync-key-ls passphrase)
+  (let [token (sync-key/mint-token passphrase (js/Date.now))]
+    (set-tokens! token token passphrase)
+    token))
+
 (defn- <refresh-tokens
   "return refreshed id-token, access-token"
   [refresh-token]
@@ -196,6 +237,10 @@
   "Refresh id-token and access-token"
   []
   (go
+    (if (sync-key-mode?)
+      ;; No account: re-mint a self-signed token from the stored passphrase.
+      (when-let [token (mint-sync-token)]
+        (set-tokens! token token (stored-sync-key)))
     (when-let [refresh-token (state/get-auth-refresh-token)]
       (let [resp (<! (<refresh-tokens refresh-token))]
         (cond
@@ -227,12 +272,18 @@
 
           :else                         ; ok
           (when (and (:id_token (:body resp)) (:access_token (:body resp)))
-            (set-tokens! (:id_token (:body resp)) (:access_token (:body resp)))))))))
+            (set-tokens! (:id_token (:body resp)) (:access_token (:body resp))))))))))
 
 (defn restore-tokens-from-localstorage
   "Refresh id-token&access-token, pull latest repos, returns nil when tokens are not available."
   []
   (println "restore-tokens-from-localstorage")
+  (if (sync-key-mode?)
+    ;; No account: re-mint from the stored passphrase and continue the login flow.
+    (when-let [passphrase (stored-sync-key)]
+      (let [token (sync-key/mint-token passphrase (js/Date.now))]
+        (set-tokens! token token passphrase)
+        (state/pub-event! [:user/fetch-info-and-graphs])))
   (let [refresh-token (js/localStorage.getItem "refresh-token")
         id-token (js/localStorage.getItem "id-token")
         access-token (js/localStorage.getItem "access-token")
@@ -263,7 +314,7 @@
         (<! (<refresh-id-token&access-token))
         ;; If tokens were not restored from cache, this is the first chance to continue login flow.
         (when (and (not restored-from-cache?) (user-uuid))
-          (state/pub-event! [:user/fetch-info-and-graphs]))))))
+          (state/pub-event! [:user/fetch-info-and-graphs])))))))
 
 (defn login-callback
   [session]

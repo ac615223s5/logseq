@@ -25,6 +25,7 @@
 
 (defn- make-env [cfg index-db assets-bucket]
   (let [allow-unverified-jwt-claims (some-> js/process .-env (aget "DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS"))
+        shared-key (some-> js/process .-env (aget "DB_SYNC_SHARED_KEY"))
         env (doto (js-obj)
               (aset "DB" index-db)
               (aset "LOGSEQ_SYNC_ASSETS" assets-bucket)
@@ -36,6 +37,8 @@
               (aset "COGNITO_JWKS_URL" (:cognito-jwks-url cfg)))]
     (when (some? allow-unverified-jwt-claims)
       (aset env "DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" allow-unverified-jwt-claims))
+    (when (some? shared-key)
+      (aset env "DB_SYNC_SHARED_KEY" shared-key))
     env))
 
 (defn- request-origin-opts

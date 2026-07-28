@@ -7,6 +7,7 @@
             [frontend.context.i18n :refer [t]]
             [frontend.handler.events :as events]
             [frontend.handler.notification :as notification]
+            [frontend.handler.user :as user-handler]
             [frontend.state :as state]
             [lambdaisland.glogi :as log]
             [logseq.shui.ui :as shui]
@@ -78,7 +79,12 @@
                        (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
 
                        (seq config/COGNITO-CLIENT-ID)
-                       (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID))))
+                       (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID)
+
+                       ;; Let the worker re-mint tokens + derive the E2EE password
+                       ;; from the passphrase (propagated as :auth/refresh-token).
+                       (user-handler/sync-key-mode?)
+                       (assoc :auth/sync-key? true))))
               (dedupe)))
         <init-sync-done? (p/deferred)
         task (m/reduce
