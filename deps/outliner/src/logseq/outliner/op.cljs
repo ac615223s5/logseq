@@ -145,7 +145,12 @@
    [:toggle-reaction
     [:catn
      [:op :keyword]
-     [:args [:tuple ::uuid ::emoji-id ::maybe-uuid]]]]])
+     [:args [:tuple ::uuid ::emoji-id ::maybe-uuid]]]]
+
+   [:cycle-todos
+    [:catn
+     [:op :keyword]
+     [:args [:tuple ::block-ids [:enum :cycle :toggle-done]]]]]])
 
 (def ^:private ops-schema
   [:schema {:registry {::block map?
@@ -202,6 +207,31 @@
           (ldb/transact! conn [reaction-tx]
                          {:outliner-op :toggle-reaction})
           true)))))
+
+(defn- cycle-todos!
+  "The next status is computed here rather than by callers so that rapid
+  successive ops read the current worker db instead of the lagging
+  main-thread db, which would drop repeats."
+  [conn block-ids transition]
+  (doseq [block-id block-ids]
+    (when-let [block (d/entity @conn [:block/uuid block-id])]
+      (let [status-value (if (ldb/class-instance? (d/entity @conn :logseq.class/Task) block)
+                           (:logseq.property/status block)
+                           (get block :logseq.property/status {}))
+            next-status (case transition
+                          :toggle-done
+                          (if (= :logseq.property/status.done (:db/ident status-value))
+                            :logseq.property/status.todo
+                            :logseq.property/status.done)
+                          :cycle
+                          (case (:db/ident status-value)
+                            :logseq.property/status.todo :logseq.property/status.doing
+                            :logseq.property/status.doing :logseq.property/status.done
+                            :logseq.property/status.done nil
+                            :logseq.property/status.todo))]
+        (outliner-property/set-block-property!
+         conn [:block/uuid block-id] :logseq.property/status
+         (when next-status (:db/id (d/entity @conn next-status))))))))
 
 (defn- import-edn-data
   [conn *result export-map {:keys [tx-meta] :as import-options}]
@@ -397,6 +427,9 @@
 
     :toggle-reaction
     (reset! *result (apply toggle-reaction! conn args))
+
+    :cycle-todos
+    (apply cycle-todos! conn args)
     nil))
 
 (defn- import-edn-op?

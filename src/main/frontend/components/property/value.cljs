@@ -1489,21 +1489,34 @@
                                     (when-let [node (.closest target "a")]
                                       (not (or (d/has-class? node "page-ref")
                                                (d/has-class? node "tag")))))
-                        (show-popup! target))))]
+                        (show-popup! target))))
+            ;; The block-left status icon toggles done/todo on click; the
+            ;; status choices dropdown moves to right click.
+            status-toggle? (and (:other-position? opts)
+                                (= :logseq.property/status (:db/ident property))
+                                (not config/publishing?))
+            toggle-status! (fn [e]
+                             (util/stop e)
+                             (state/clear-selection!)
+                             (when-not (or (util/shift-key? e) (util/meta-key? e))
+                               (editor-handler/transition-todos! [(:block/uuid block)] :toggle-done)))]
         (shui/trigger-as
          (if (:other-position? opts) :div.jtrigger :div.jtrigger.flex.flex-1.w-full.cursor-pointer)
-         {:ref *el
-          :id trigger-id
-          :tabIndex 0
-          :on-click show!
-          :on-key-down (fn [e]
-                         (case (util/ekey e)
-                           ("Backspace" "Delete")
-                           (delete-block-property! block property opts)
-                           (" " "Enter")
-                           (do (some-> (hooks/deref *el) (.click))
-                               (util/stop e))
-                           nil))}
+         (cond->
+          {:ref *el
+           :id trigger-id
+           :tabIndex 0
+           :on-click (if status-toggle? toggle-status! show!)
+           :on-key-down (fn [e]
+                          (case (util/ekey e)
+                            ("Backspace" "Delete")
+                            (delete-block-property! block property opts)
+                            (" " "Enter")
+                            (do (some-> (hooks/deref *el) (.click))
+                                (util/stop e))
+                            nil))}
+           status-toggle?
+           (assoc :on-context-menu show!))
          (if (string/blank? value)
            (property-empty-text-value property opts)
            (value-render)))))))

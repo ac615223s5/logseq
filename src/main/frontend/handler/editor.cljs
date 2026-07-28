@@ -668,22 +668,15 @@
   []
   (distinct (seq (state/get-selection-blocks))))
 
-(defn db-based-cycle-todo!
-  [block]
-  (let [status-value (if (ldb/class-instance? (db/entity :logseq.class/Task) block)
-                       (:logseq.property/status block)
-                       (get block :logseq.property/status {}))
-        next-status (case (:db/ident status-value)
-                      :logseq.property/status.todo
-                      :logseq.property/status.doing
-                      :logseq.property/status.doing
-                      :logseq.property/status.done
-                      :logseq.property/status.done
-                      nil
-                      :logseq.property/status.todo)]
-    (property-handler/set-block-property! (:block/uuid block)
-                                          :logseq.property/status
-                                          (:db/id (db/entity next-status)))))
+(defn transition-todos!
+  "Advance the status of the given blocks. The next status is computed by the
+  db worker so that rapid successive calls don't read a stale status from the
+  lagging main-thread db."
+  [block-uuids transition]
+  (when (seq block-uuids)
+    (ui-outliner-tx/transact!
+     {:outliner-op :cycle-todos}
+     (outliner-op/cycle-todos! block-uuids transition))))
 
 (defn cycle-todos!
   []
@@ -691,26 +684,15 @@
     (let [ids (->> (distinct (map #(when-let [id (dom/attr % "blockid")]
                                      (uuid id)) blocks))
                    (remove nil?))]
-      (ui-outliner-tx/transact!
-       {:outliner-op :cycle-todos}
-       (doseq [id ids]
-         (when-let [block (db/entity [:block/uuid id])]
-           (db-based-cycle-todo! block)))))))
+      (transition-todos! ids :cycle))))
 
 (defn cycle-todo!
   []
-  #_:clj-kondo/ignore
   (when-not (state/get-editor-action)
-    (if-let [blocks (seq (get-selected-blocks))]
+    (if (seq (get-selected-blocks))
       (cycle-todos!)
-      (when-let [edit-block (state/get-edit-block)]
-        (let [edit-input-id (state/get-edit-input-id)
-              current-input (gdom/getElement edit-input-id)]
-          (when-let [block (db/entity (:db/id edit-block))]
-            (let [pos (state/get-edit-pos)]
-              (ui-outliner-tx/transact!
-               {:outliner-op :cycle-todos}
-               (db-based-cycle-todo! block)))))))))
+      (when-let [id (:block/uuid (state/get-edit-block))]
+        (transition-todos! [id] :cycle)))))
 
 (defn delete-block-aux!
   [{:block/keys [uuid] :as _block}]
