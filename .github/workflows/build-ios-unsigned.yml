@@ -36,9 +36,17 @@ jobs:
         with:
           xcode-version: '26.0.1'
 
+      - name: Show runtimes
+        run: |
+          xcrun simctl list > /dev/null
+
       - name: Install iOS platform
         run: |
-          xcodebuild -downloadPlatform iOS
+          for i in 1 2 3; do
+            xcodebuild -downloadPlatform iOS && break
+            echo "downloadPlatform attempt $i failed; retrying in 30s"
+            sleep 30
+          done
 
       - name: Install Node.js
         uses: actions/setup-node@v4
