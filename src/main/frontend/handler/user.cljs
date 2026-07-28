@@ -362,7 +362,14 @@
 (defn logout []
   (clear-e2ee-password!)
   (clear-tokens)
-  (.clear js/localStorage)
+  ;; Preserve the sync server URL across logout — it's a connection preference,
+  ;; not a credential. Otherwise logging out to change the passphrase wipes it and
+  ;; the login form falls back to its default, silently pointing sync at the wrong
+  ;; server (nothing syncs under the new passphrase).
+  (let [sync-server-url (js/localStorage.getItem "sync-server-url")]
+    (.clear js/localStorage)
+    (when (and (string? sync-server-url) (not (string/blank? sync-server-url)))
+      (js/localStorage.setItem "sync-server-url" sync-server-url)))
   (state/clear-user-info!)
   (state/pub-event! [:user/logout])
   (reset! flows/*current-login-user :logout))

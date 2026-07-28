@@ -312,7 +312,13 @@
       :reactive/query-dbs                    {}
 
       ;; login, userinfo, token, ...
-      :auth/refresh-token                    (some-> (storage/get "refresh-token") str)
+      ;; NOTE: refresh-token is always written raw (js/localStorage.setItem), never
+      ;; via storage/set, so it must be read raw too. Passing it through storage/get
+      ;; runs the EDN reader over the raw string; a sync-key passphrase containing a
+      ;; reader macro char (e.g. `^`, `@`, `#`) then throws at boot and blanks the app.
+      :auth/refresh-token                    (some-> (when-not util/node-test?
+                                                       (.getItem js/localStorage "refresh-token"))
+                                                     str)
       :auth/access-token                     nil
       :auth/id-token                         nil
 
