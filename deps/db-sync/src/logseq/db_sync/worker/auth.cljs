@@ -64,20 +64,66 @@
       (and (number? exp)
            (<= exp now-s)))))
 
+(defn- shared-key [env]
+  (let [k (some-> env (aget "DB_SYNC_SHARED_KEY"))]
+    (when (and (string? k) (not (string/blank? k))) k)))
+
+(defn- jwt-alg [token]
+  (try
+    (let [parts (string/split token #"\.")]
+      (when (= 3 (count parts))
+        (aget (decode-jwt-part (first parts)) "alg")))
+    (catch :default _ nil)))
+
+(defn- self-host-claims
+  "Decoded claims iff `token` is one of our account-less self-hosted tokens
+   (HS256, iss=logseq-selfhost). Signature is NOT checked here."
+  [token]
+  (let [claims (unsafe-jwt-claims token)]
+    (when (and (= "HS256" (jwt-alg token))
+               (= "logseq-selfhost" (some-> claims (aget "iss"))))
+      claims)))
+
+(defn- sub-allowed?
+  "Optional allowlist. When DB_SYNC_ALLOWED_SUBS is set (comma-separated), only
+   those subs are accepted; otherwise every sub is allowed (encryption-only)."
+  [env sub]
+  (let [allow (some-> env (aget "DB_SYNC_ALLOWED_SUBS"))]
+    (if (and (string? allow) (not (string/blank? allow)))
+      (contains? (set (map string/trim (string/split allow #","))) sub)
+      true)))
+
 (defn auth-claims [request env]
   (let [token (token-from-request request)]
     (if (string? token)
       (if (expired-token? token)
         (p/resolved nil)
-        (-> (authorization/verify-jwt token env)
-            (p/catch (fn [error]
-                       (cond
-                         (recoverable-auth-error? error)
-                         nil
+        (let [sk (shared-key env)
+              sh-claims (self-host-claims token)]
+          (cond
+            ;; Account-less self-hosted token with an HMAC shared key configured:
+            ;; enforce the signature (possession of the key authorizes).
+            (and sh-claims sk)
+            (-> (authorization/verify-hs256 token sk)
+                (p/catch (fn [_] nil)))
 
-                         (allow-unverified-jwt-claims? env)
-                         (unsafe-jwt-claims token)
+            ;; Encryption-only (dumb server): no shared key -> trust the claims and
+            ;; namespace by `sub`. Auth is implicit: notes are E2E-encrypted and the
+            ;; sub is an unguessable passphrase hash. Optional DB_SYNC_ALLOWED_SUBS.
+            sh-claims
+            (p/resolved (when (sub-allowed? env (aget sh-claims "sub")) sh-claims))
 
-                         :else
-                         (p/rejected error))))))
+            ;; Anything else (e.g. a real Cognito token) -> verify normally.
+            :else
+            (-> (authorization/verify-jwt token env)
+                (p/catch (fn [error]
+                           (cond
+                             (recoverable-auth-error? error)
+                             nil
+
+                             (allow-unverified-jwt-claims? env)
+                             (unsafe-jwt-claims token)
+
+                             :else
+                             (p/rejected error))))))))
       (p/resolved nil))))

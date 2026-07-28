@@ -1,5 +1,6 @@
 (ns frontend.components.repo
   (:require [clojure.string :as string]
+            [frontend.common.sync-key :as sync-key]
             [frontend.components.rtc.indicator :as rtc-indicator]
             [frontend.config :as config]
             [frontend.context.i18n :as i18n :refer [t]]
@@ -601,12 +602,20 @@
   [{:keys [cloud? graph-e2ee? refresh-token token user-uuid e2ee-rsa-key-ensured?]} set-e2ee-rsa-key-ensured?]
   (if (and cloud? graph-e2ee? refresh-token token user-uuid (not e2ee-rsa-key-ensured?))
     (-> (p/do!
-         (state/pub-event! [:rtc/sync-app-state])
+         ;; Await the auth-state push so the worker has the token + passphrase
+         ;; BEFORE it makes authenticated E2EE requests / derives the password.
+         (rtc-handler/<sync-auth-state-to-db-worker!)
          (state/<invoke-db-worker :thread-api/set-db-sync-config
                                   {:enabled? true
                                    :ws-url (config/db-sync-ws-url)
                                    :http-base (config/db-sync-http-base)})
-         (p/let [rsa-key-pair (state/<invoke-db-worker :thread-api/db-sync-ensure-user-rsa-keys)]
+         ;; In sync-key mode derive the E2EE password on the main thread and pass
+         ;; it in, so RSA-key generation doesn't depend on the worker having auth
+         ;; state pushed yet (that push races with this call).
+         (p/let [opts (when (user-handler/sync-key-mode?)
+                        {:password (:e2ee-password
+                                    (sync-key/derive (user-handler/stored-sync-key)))})
+                 rsa-key-pair (state/<invoke-db-worker :thread-api/db-sync-ensure-user-rsa-keys opts)]
            (set-e2ee-rsa-key-ensured? (some? rsa-key-pair))))
         (p/catch (fn [e]
                    (log/error :db-sync/ensure-user-rsa-keys-failed e)

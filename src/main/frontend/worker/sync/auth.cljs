@@ -1,6 +1,7 @@
 (ns frontend.worker.sync.auth
   "Auth and endpoint helpers for db sync."
   (:require [clojure.string :as string]
+            [frontend.common.sync-key :as sync-key]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.util :as sync-util]
@@ -78,9 +79,23 @@
 
 (defn <resolve-ws-token
   []
-  (let [token (sync-util/auth-token)
+  (let [state @worker-state/*state
+        token (sync-util/auth-token)
         token-expired? (id-token-expired? token)]
-    (if (and (not (sync-util/cli-node-owner?)) token-expired?)
+    (cond
+      ;; Account-less self-hosted sync: re-mint a self-signed token from the
+      ;; passphrase (propagated as :auth/refresh-token) instead of hitting Cognito.
+      ;; Detect sync-key mode from the (possibly expired) token's issuer.
+      (and token-expired?
+           (= sync-key/issuer (some-> token worker-util/parse-jwt :iss)))
+      (let [passphrase (:auth/refresh-token state)]
+        (if (seq passphrase)
+          (let [new-token (sync-key/mint-token passphrase (common-util/time-ms))]
+            (worker-state/set-new-state! {:auth/id-token new-token})
+            (p/resolved new-token))
+          (p/resolved token)))
+
+      (and (not (sync-util/cli-node-owner?)) token-expired?)
       (p/let [{:keys [id-token access-token]} (<refresh-id&access-token)]
         (when-not (seq id-token)
           (throw (ex-info "worker auth refresh returned empty id-token"
@@ -89,6 +104,8 @@
          (cond-> {:auth/id-token id-token}
            (seq access-token) (assoc :auth/access-token access-token)))
         id-token)
+
+      :else
       (p/resolved token))))
 
 (defn get-user-uuid
