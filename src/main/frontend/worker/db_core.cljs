@@ -813,6 +813,12 @@
   [repo graph-id graph-e2ee?]
   (sync-download/download-graph-by-id! repo graph-id graph-e2ee?))
 
+;; Link to an existing remote graph while keeping local content, in contrast to
+;; download-graph-by-id! which replaces it. Returns :conflicts and :stats.
+(def-thread-api :thread-api/db-sync-merge-graph-by-id
+  [repo graph-id graph-e2ee?]
+  (sync-download/merge-graph-by-id! repo graph-id graph-e2ee?))
+
 ;; [graph service]
 (defonce *service (atom []))
 
