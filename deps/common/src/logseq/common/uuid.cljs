@@ -35,6 +35,36 @@ the remaining chars for data of this type"
   {:pre [(keyword? db-ident)]}
   (gen-block-uuid db-ident "00000002"))
 
+(def ^:private uuid-pattern
+  #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+;; Account-less self-hosted sync ids: "sk-" followed by 32 hex chars (the 16
+;; bytes of HKDF output derived from the passphrase). See frontend.common.sync-key.
+(def ^:private sync-key-user-id-pattern #"^sk-([0-9a-fA-F]{32})$")
+
+(defn- hex32->uuid
+  [hex]
+  (uuid (str (subs hex 0 8) "-" (subs hex 8 12) "-" (subs hex 12 16) "-"
+             (subs hex 16 20) "-" (subs hex 20 32))))
+
+(defn user-id->uuid
+  "Stable :block/uuid for a sync user id.
+
+  Cognito subs are already UUIDs and pass through unchanged. Account-less
+  self-hosted ids carry exactly 128 bits, so they map straight onto the UUID
+  layout; anything else falls back to a hashed '00000007-' uuid.
+
+  This has to return a real UUID: the created-by entity's :block/uuid reaches
+  the search index, which rejects ids that aren't uuid-shaped and aborts the
+  whole batch."
+  [user-id]
+  (when (string? user-id)
+    (if-let [hex (second (re-matches sync-key-user-id-pattern user-id))]
+      (hex32->uuid hex)
+      (if (re-matches uuid-pattern user-id)
+        (uuid user-id)
+        (gen-block-uuid user-id "00000007")))))
+
 (defn gen-uuid
   "supported type:
   - :journal-page-uuid, 00000001

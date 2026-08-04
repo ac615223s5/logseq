@@ -363,6 +363,44 @@
                (fn []
                  (state/set-state! :rtc/downloading-graph-uuid nil)))))))))
 
+(defn <rtc-merge-graph!
+  "Link an existing local graph to a remote one without discarding either side.
+
+  Unlike <rtc-download-graph!, which replaces the local graph with the remote
+  snapshot, this reconciles the two: local-only content stays, and edits both
+  sides made to the same block become conflicts resolvable from the block. The
+  local graph must already exist - there is nothing to merge into otherwise."
+  ([graph-name graph-uuid] (<rtc-merge-graph! graph-name graph-uuid true))
+  ([graph-name graph-uuid graph-e2ee?]
+   (if-let [operation (active-graph-operation)]
+     (reject-graph-operation-in-progress :download operation)
+     (do
+       (state/set-state! :rtc/downloading-graph-uuid graph-uuid)
+       (state/pub-event!
+        [:rtc/log {:type :rtc.log/download
+                   :sub-type :download-progress
+                   :graph-uuid graph-uuid
+                   :message "Preparing graph merge"}])
+       (let [graph-e2ee? (normalize-graph-e2ee? graph-e2ee?)
+             base (http-base)]
+         (-> (if (and graph-uuid base)
+               (p/let [_ (js/Promise. user-handler/task--ensure-id&access-token)
+                       graph (str config/db-version-prefix graph-name)
+                       _ (<ensure-download-runtime-bound! graph)
+                       result (state/<invoke-db-worker :thread-api/db-sync-merge-graph-by-id
+                                                       graph graph-uuid graph-e2ee?)
+                       _ (when (util/electron?)
+                           (state/<invoke-db-worker :thread-api/db-sync-download-missing-assets
+                                                    graph graph-uuid))]
+                 result)
+               (p/rejected (ex-info "db-sync missing graph info"
+                                    {:type :db-sync/invalid-graph
+                                     :graph-uuid graph-uuid
+                                     :base base})))
+             (p/finally
+               (fn []
+                 (state/set-state! :rtc/downloading-graph-uuid nil)))))))))
+
 (defn <get-remote-graphs
   []
   (let [base (http-base)]

@@ -160,6 +160,43 @@
       (when target
         (state/pub-event! [:graph/open-new-window target])))))
 
+(defn- local-graph-with-name
+  "An existing local graph carrying `graph-name`, if there is one."
+  [repos graph-name]
+  (some (fn [{:keys [root url]}]
+          (when (and root (= graph-name (config/db-graph-name url))) url))
+        repos))
+
+(defn- open-remote-graph!
+  "Opening a remote graph when a local graph already has that name is a choice,
+  not a default. Replacing silently discards whatever is only on this device -
+  and binding the two together without reconciling them is what leaves the sides
+  permanently diverged - so ask which one is meant."
+  [repos {:keys [GraphName GraphUUID GraphSchemaVersion graph-e2ee?]}]
+  (if-not (local-graph-with-name repos GraphName)
+    (state/pub-event! [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
+    (shui/dialog-open!
+     (fn [{:keys [close]}]
+       [:div.flex.flex-col.gap-3
+        [:h2.text-lg.font-medium (t :graph/open-remote-graph-title GraphName)]
+        [:p.text-sm.text-muted-foreground (t :graph/open-remote-graph-desc GraphName)]
+        [:div.flex.flex-col.gap-2.pt-2
+         (shui/button
+          {:on-click (fn []
+                       (close)
+                       (state/pub-event! [:rtc/merge-remote-graph
+                                          GraphName GraphUUID GraphSchemaVersion graph-e2ee?]))}
+          (t :sync/merge-label))
+         [:small.text-muted-foreground (t :sync/merge-description)]
+         (shui/button
+          {:variant :outline
+           :on-click (fn []
+                       (close)
+                       (state/pub-event! [:rtc/download-remote-graph
+                                          GraphName GraphUUID GraphSchemaVersion graph-e2ee?]))}
+          (t :sync/replace-label))
+         [:small.text-muted-foreground (t :sync/replace-description)]]]))))
+
 (hsx/defc ^:large-vars/cleanup-todo repos-inner
   "Graph list in `All graphs` page"
   [repos]
@@ -178,7 +215,7 @@
                                      (state/pub-event! [:graph/switch url])
 
                                      remote?
-                                     (state/pub-event! [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
+                                     (open-remote-graph! repos repo)
 
                                      :else
                                      nil))))]
@@ -221,6 +258,26 @@
                  :on-click #(when-not disabled?
                               (delete-local-graph! repo))}
                 (t :graph/delete-local-action))))
+
+           ;; An already-linked graph shows as a single row, so the merge choice
+           ;; offered when opening a remote graph never reaches it. This is how
+           ;; a linked graph that has drifted from the server gets reconciled
+           ;; without discarding either side.
+           (when (and root remote? GraphUUID)
+             (shui/dropdown-menu-item
+              {:key "merge-with-server"
+               :class "merge-with-server-menu-item"
+               :on-click (fn []
+                           (-> (shui/dialog-confirm!
+                                [:p (t :sync/merge-description)]
+                                (merge dialog-config
+                                       {:title (t :graph/merge-with-server-confirm GraphName)}))
+                               (p/then
+                                (fn []
+                                  (state/pub-event! [:rtc/merge-remote-graph
+                                                     GraphName GraphUUID
+                                                     GraphSchemaVersion graph-e2ee?])))))}
+              (t :graph/merge-with-server-action)))
 
            (when (and root
                       (user-handler/logged-in?)

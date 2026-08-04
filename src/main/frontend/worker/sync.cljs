@@ -15,9 +15,9 @@
    [frontend.worker.sync.util :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
+   [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
-   [promesa.core :as p]
-   [logseq.common.config :as common-config]))
+   [promesa.core :as p]))
 
 (def ^:private reconnect-base-delay-ms 1000)
 (def ^:private reconnect-max-delay-ms 30000)
@@ -201,6 +201,10 @@
    :upload-request (atom nil)
    :last-sync-error (atom nil)
    :reconnect (atom {:attempt 0 :timer nil})
+   ;; Set once the bound graph-uuid is known to be absent from the server, so
+   ;; the reconnect loop stops instead of retrying a graph that can't exist.
+   :binding-invalid? (atom false)
+   :binding-checked? (atom false)
    :stale-kill-timer (atom nil)
    :last-ws-message-ts (atom (common-util/time-ms))
    :online-users (atom [])
@@ -210,31 +214,91 @@
 
 (defn- schedule-reconnect!
   [repo client url reason]
-  (when-let [reconnect (:reconnect client)]
-    (let [{:keys [attempt timer]} @reconnect]
-      (when (nil? timer)
-        (let [delay (reconnect-delay-ms attempt)
-              timeout-id (js/setTimeout
-                          (fn []
-                            (log/info :db-sync/ws-reconnect {:repo repo
-                                                             :db-sync-client-exists? (some? @worker-state/*db-sync-client)})
-                            (swap! reconnect assoc :timer nil)
-                            (when-let [current @worker-state/*db-sync-client]
-                              (when (and (= (:repo current) repo)
-                                         (= (:graph-id current) (:graph-id client)))
-                                (-> (p/let [token (<resolve-ws-token)
-                                            updated (connect! repo current url token)]
-                                      (reset! worker-state/*db-sync-client updated))
-                                    (p/catch (fn [error]
-                                               (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
-                                               (schedule-reconnect! repo current url :connect-failed)))))))
-                          delay)]
-          (swap! reconnect assoc :timer timeout-id :attempt (inc attempt))
-          (log/info :db-sync/ws-reconnect-scheduled
-                    {:repo repo :delay delay :attempt attempt :reason reason}))))))
+  (when-not (some-> (:binding-invalid? client) deref)
+    (when-let [reconnect (:reconnect client)]
+      (let [{:keys [attempt timer]} @reconnect]
+        (when (nil? timer)
+          (let [delay (reconnect-delay-ms attempt)
+                timeout-id (js/setTimeout
+                            (fn []
+                              (log/info :db-sync/ws-reconnect {:repo repo
+                                                               :db-sync-client-exists? (some? @worker-state/*db-sync-client)})
+                              (swap! reconnect assoc :timer nil)
+                              (when-let [current @worker-state/*db-sync-client]
+                                (when (and (= (:repo current) repo)
+                                           (= (:graph-id current) (:graph-id client)))
+                                  (-> (p/let [token (<resolve-ws-token)
+                                              updated (connect! repo current url token)]
+                                        (reset! worker-state/*db-sync-client updated))
+                                      (p/catch (fn [error]
+                                                 (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
+                                                 (schedule-reconnect! repo current url :connect-failed)))))))
+                            delay)]
+            (swap! reconnect assoc :timer timeout-id :attempt (inc attempt))
+            (log/info :db-sync/ws-reconnect-scheduled
+                      {:repo repo :delay delay :attempt attempt :reason reason})))))))
+
+(defn- check-graph-binding!
+  "Diagnose a socket that was rejected before it ever opened.
+
+  That is what a stale graph binding looks like: the graph-uuid recorded in the
+  local client-ops db isn't one this account has on the *currently configured*
+  server. Changing the sync server URL doesn't rewrite existing per-graph
+  bindings, so a graph created against an old server keeps dialing a uuid the
+  new server has never heard of - and every attempt is refused at the handshake,
+  which is otherwise indistinguishable from the server being down.
+
+  Checks the remote graph list once per client. If the binding really is absent,
+  records a diagnostic and latches `:binding-invalid?` so the reconnect loop
+  stops rather than retrying forever. Returns a promise resolving to true when
+  the binding is stale."
+  [repo client]
+  (let [*checked? (:binding-checked? client)
+        base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+    ;; Without a configured server there's nothing to compare against, and an
+    ;; empty graph list would otherwise read as a stale binding.
+    (if (or (nil? *checked?) @*checked? (not (seq base)))
+      (p/resolved false)
+      (do
+        (reset! *checked? true)
+        (-> (p/let [graphs (sync-upload/list-remote-graphs!)
+                    graph-id (str (:graph-id client))
+                    remote-ids (set (keep #(some-> (:graph-id %) str) graphs))
+                    remote-name (some-> (worker-state/get-datascript-conn repo)
+                                        deref
+                                        ldb/get-graph-remote-name)
+                    ;; The name the user picked is stable across servers, so a
+                    ;; remote graph carrying it is the one they meant - offered
+                    ;; as a re-link candidate, never bound to silently.
+                    same-name-id (when (seq remote-name)
+                                   (some (fn [{:keys [graph-name graph-id]}]
+                                           (when (= remote-name graph-name) graph-id))
+                                         graphs))]
+              (if (contains? remote-ids graph-id)
+                false
+                (let [data (cond-> {:repo repo
+                                    :graph-uuid graph-id
+                                    :remote-graph-ids (vec remote-ids)}
+                             (seq remote-name) (assoc :remote-graph-name remote-name)
+                             (seq same-name-id) (assoc :relink-candidate-graph-id same-name-id))]
+                  (log/error :db-sync/graph-not-on-server data)
+                  (sync-util/set-last-sync-error!
+                   client
+                   (ex-info "local graph is not on the sync server; re-link it by downloading the remote graph or uploading this one"
+                            (assoc data :code :db-sync/graph-not-on-server)))
+                  (some-> (:binding-invalid? client) (reset! true))
+                  ;; Cancel the attempt queued while this check was in flight.
+                  (some-> (:reconnect client) clear-reconnect-timer!)
+                  true)))
+            (p/catch (fn [error]
+                       ;; Couldn't reach the server: that's not evidence the
+                       ;; binding is stale, so allow a later re-check.
+                       (reset! *checked? false)
+                       (log/warn :db-sync/graph-binding-check-failed {:repo repo :error error})
+                       false)))))))
 
 (defn- attach-ws-handlers!
-  [repo client ws url]
+  [repo client ws url *opened?]
   (set! (.-onmessage ws)
         (fn [event]
           (touch-last-ws-message! client)
@@ -244,11 +308,17 @@
   (set! (.-onerror ws) (fn [error] (log/error :db-sync/ws-error error)))
   (set! (.-onclose ws)
         (fn [_]
-          (log/info :db-sync/ws-closed {:repo repo})
+          (log/info :db-sync/ws-closed {:repo repo :opened? (boolean (some-> *opened? deref))})
           (clear-stale-ws-loop-timer! client)
           (clear-inflight! client)
           (update-online-users! client [])
           (set-ws-state! client :closed)
+          ;; Never opened means the handshake itself was refused, which is what a
+          ;; stale binding looks like. Ask once, but don't hold up reconnection
+          ;; while the server answers - if the binding really is gone the check
+          ;; latches it off and cancels the attempt it queued.
+          (when-not (some-> *opened? deref)
+            (check-graph-binding! repo client))
           (schedule-reconnect! repo client url :close))))
 
 (defn- detach-ws-handlers!
@@ -318,10 +388,15 @@
                                :token-exists? (some? (or token (auth-token)))})
   (when-let [token' (or token (auth-token))]
     (let [ws (platform/websocket-connect (platform/current) (sync-transport/append-token url token'))
+          *opened? (atom false)
           updated (assoc client :ws ws)]
-      (attach-ws-handlers! repo updated ws url)
+      (attach-ws-handlers! repo updated ws url *opened?)
       (set! (.-onopen ws)
             (fn [_]
+              (reset! *opened? true)
+              ;; A successful handshake proves the binding is good; let a future
+              ;; failure re-check it.
+              (some-> (:binding-checked? updated) (reset! false))
               (reset-reconnect! updated)
               (touch-last-ws-message! updated)
               (set-ws-state! updated :open)
@@ -342,23 +417,20 @@
     (reset! worker-state/*db-sync-client nil))
   (p/resolved nil))
 
-(declare list-remote-graphs!)
+(defn- resolve-start-graph-id
+  "Which remote graph this local graph syncs with, or nil when it isn't linked.
 
-(defn- <resolve-start-graph-id
+  A link is only ever established by an explicit user action: downloading an
+  existing remote graph, or uploading this one as a new remote graph. Both
+  transfer a base snapshot, so the two sides begin holding identical content.
+
+  This used to fall back to matching a remote graph by name. That silently bound
+  unrelated graphs that merely shared a name, and because it only subscribed to
+  the tx stream without ever fetching the snapshot, the two sides stayed
+  permanently diverged while every counter reported a clean sync. Sync is not
+  something to infer - an unlinked graph stays unlinked until the user picks."
   [repo]
-  (if-let [graph-id (sync-util/get-graph-id repo)]
-    (p/resolved graph-id)
-    (let [target-graph-name (some-> repo common-config/strip-leading-db-version-prefix)]
-      (if-not (seq target-graph-name)
-        (p/resolved nil)
-        (p/let [remote-graphs (list-remote-graphs!)
-                remote-graph-id (some (fn [{:keys [graph-name graph-id]}]
-                                        (when (= target-graph-name graph-name)
-                                          graph-id))
-                                      remote-graphs)]
-          (when (seq remote-graph-id)
-            (ensure-client-graph-uuid! repo remote-graph-id)
-            remote-graph-id))))))
+  (sync-util/get-graph-id repo))
 
 (defn start!
   [repo]
@@ -371,11 +443,13 @@
       (do
         (log/info :db-sync/start-skipped {:repo repo :graph-id graph-id :base base})
         (p/resolved nil))
-      (p/let [graph-id (<resolve-start-graph-id repo)]
+      (p/let [graph-id (resolve-start-graph-id repo)]
         (cond
           (not (seq graph-id))
           (do
-            (log/info :db-sync/start-skipped {:repo repo :graph-id graph-id :base base})
+            ;; Not an error: this graph is local-only until the user links it to
+            ;; a remote graph, by downloading one or uploading this one.
+            (log/info :db-sync/graph-not-linked {:repo repo :base base})
             (p/resolved nil))
 
           (not (client-op-ready? repo))

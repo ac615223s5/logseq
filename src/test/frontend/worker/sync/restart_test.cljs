@@ -174,7 +174,8 @@
                   (fn [topic payload]
                     (swap! broadcasts conj [topic payload]))]
       (try
-        (#'sync/attach-ws-handlers! "stale-repo" client ws "wss://sync.example.test/sync/graph-1")
+        ;; *opened? true: an established connection dropping, not a refused handshake
+        (#'sync/attach-ws-handlers! "stale-repo" client ws "wss://sync.example.test/sync/graph-1" (atom true))
         ((.-onclose ws) #js {})
         (is (= :closed @(:ws-state client)))
         (is (empty? @(:inflight client)))

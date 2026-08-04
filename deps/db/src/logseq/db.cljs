@@ -785,6 +785,12 @@
   [db]
   (when db (get-key-value db :logseq.kv/local-graph-uuid)))
 
+(defn get-graph-remote-name
+  "The remote graph name this graph is linked to. Survives a sync server change,
+  unlike the per-server graph uuid."
+  [db]
+  (when db (get-key-value db :logseq.kv/graph-remote-name)))
+
 (defn get-graph-schema-version
   [db]
   (when db (get-key-value db :logseq.kv/schema-version)))

@@ -396,6 +396,29 @@
               (when (rtc-error/download-decrypt-failed? e)
                 (notification/show! (t :encryption/wrong-password) :error false))))))
 
+(defmethod handle :rtc/merge-remote-graph [[_ graph-name graph-uuid graph-schema-version graph-e2ee?]]
+  (assert (= (:major (db-schema/parse-schema-version db-schema/version))
+             (:major (db-schema/parse-schema-version graph-schema-version)))
+          {:app db-schema/version
+           :remote-graph graph-schema-version})
+  (->
+   (p/let [{:keys [conflicts]} (rtc-handler/<rtc-merge-graph! graph-name graph-uuid graph-e2ee?)
+           _ (rtc-handler/<get-remote-graphs)
+           _ (state/pub-event! [:graph/switch (str config/db-version-prefix graph-name) {:rtc-download? true}])]
+     ;; Say what happened: a merge that silently leaves conflicts behind is the
+     ;; failure mode this whole path exists to avoid.
+     (notification/show!
+      (if (seq conflicts)
+        (t :sync/merge-completed-with-conflicts (count conflicts))
+        (t :sync/merge-completed))
+      (if (seq conflicts) :warning :success)
+      false))
+   (p/catch (fn [e]
+              (println "RTC merge graph failed, error:")
+              (log/error :rtc-merge-graph-failed e)
+              (when (rtc-error/download-decrypt-failed? e)
+                (notification/show! (t :encryption/wrong-password) :error false))))))
+
 ;; db-worker -> UI
 (defmethod handle :db/sync-changes [[_ data]]
   (let [retract-datoms (filter (fn [d] (and (= :block/uuid (:a d)) (false? (:added d)))) (:tx-data data))

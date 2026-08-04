@@ -9,6 +9,11 @@
      :logseq.kv/db-type                      {:doc "Set to \"db\" if it's a db-graph"}
      :logseq.kv/graph-uuid                   {:doc "Store graph-uuid if it's a rtc enabled graph"
                                               :rtc {:rtc/ignore-entity-when-init-upload true}}
+     :logseq.kv/graph-remote-name            {:doc "Name of the remote graph this graph is linked to.
+Graph uuids are minted per server, so a binding recorded against one server means nothing to the next.
+The name is what the user chose and is stable across servers, making it the durable half of the link;
+:logseq.kv/graph-uuid is the id it currently resolves to."
+                                              :rtc {:rtc/ignore-entity-when-init-upload true}}
      :logseq.kv/local-graph-uuid             {:doc "Store graph-uuid if it's a local graph"
                                               :rtc {:rtc/ignore-entity-when-init-upload true}}
      :logseq.kv/import-type                  {:doc "If graph is imported, identifies how a graph is imported including which UI or CLI import process. CLI scripts can set this to a custom value.
