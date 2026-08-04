@@ -389,9 +389,17 @@ jobs:
             }
           }
           '@
-          $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
-          $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
-          pnpm exec electron-builder --config $signCfgPath --publish never
+          if ([string]::IsNullOrEmpty($env:AZURE_TENANT_ID)) {
+            # No Trusted Signing credentials (forks). Build unsigned rather than
+            # failing: the sign config also asserts "Logseq, Inc." as publisher,
+            # which is not ours to claim.
+            Write-Host "AZURE_TENANT_ID unset - building unsigned"
+            pnpm exec electron-builder --publish never
+          } else {
+            $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
+            $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
+            pnpm exec electron-builder --config $signCfgPath --publish never
+          }
         working-directory: ./static
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -463,9 +471,17 @@ jobs:
             }
           }
           '@
-          $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
-          $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
-          pnpm exec electron-builder --config $signCfgPath --win nsis zip --arm64 --publish never
+          if ([string]::IsNullOrEmpty($env:AZURE_TENANT_ID)) {
+            # No Trusted Signing credentials (forks). Build unsigned rather than
+            # failing: the sign config also asserts "Logseq, Inc." as publisher,
+            # which is not ours to claim.
+            Write-Host "AZURE_TENANT_ID unset - building unsigned"
+            pnpm exec electron-builder --win nsis zip --arm64 --publish never
+          } else {
+            $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
+            $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
+            pnpm exec electron-builder --config $signCfgPath --win nsis zip --arm64 --publish never
+          }
         working-directory: ./static
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
