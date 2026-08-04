@@ -734,7 +734,10 @@ jobs:
           sha256sum *-darwin-* > SHA256SUMS.txt
           sha256sum *-win-* >> SHA256SUMS.txt
           sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          # Android is optional (the build-android input), so there may be no apk
+          if compgen -G "*.apk" > /dev/null; then
+            sha256sum *.apk >> SHA256SUMS.txt
+          fi
           cat SHA256SUMS.txt
 
       - name: List files
@@ -826,7 +829,10 @@ jobs:
           sha256sum *-darwin-* > SHA256SUMS.txt
           sha256sum *-win-* >> SHA256SUMS.txt
           sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          # Android is optional (the build-android input), so there may be no apk
+          if compgen -G "*.apk" > /dev/null; then
+            sha256sum *.apk >> SHA256SUMS.txt
+          fi
           cat SHA256SUMS.txt
 
       - name: Create Release Draft
