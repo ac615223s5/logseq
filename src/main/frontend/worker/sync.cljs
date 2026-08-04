@@ -274,6 +274,8 @@
                    (ex-info "local graph is not on the sync server; re-link it by downloading the remote graph or uploading this one"
                             (assoc data :code :db-sync/graph-not-on-server)))
                   (some-> (:binding-invalid? client) (reset! true))
+                  ;; Cancel the attempt queued while this check was in flight.
+                  (some-> (:reconnect client) clear-reconnect-timer!)
                   true)))
             (p/catch (fn [error]
                        ;; Couldn't reach the server: that's not evidence the
@@ -298,13 +300,13 @@
           (clear-inflight! client)
           (update-online-users! client [])
           (set-ws-state! client :closed)
-          (if (some-> *opened? deref)
-            (schedule-reconnect! repo client url :close)
-            ;; Never opened - the handshake itself was refused. Check whether the
-            ;; graph binding is stale before queueing yet another attempt.
-            (-> (check-graph-binding! repo client)
-                (p/finally (fn []
-                             (schedule-reconnect! repo client url :close))))))))
+          ;; Never opened means the handshake itself was refused, which is what a
+          ;; stale binding looks like. Ask once, but don't hold up reconnection
+          ;; while the server answers - if the binding really is gone the check
+          ;; latches it off and cancels the attempt it queued.
+          (when-not (some-> *opened? deref)
+            (check-graph-binding! repo client))
+          (schedule-reconnect! repo client url :close))))
 
 (defn- detach-ws-handlers!
   [ws]

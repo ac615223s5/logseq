@@ -53,7 +53,7 @@
                     platform/websocket-connect (fn [platform' url]
                                                  (swap! ws-calls conj {:platform platform' :url url})
                                                  (js-obj))
-                    db-sync/attach-ws-handlers! (fn [repo _client ws url]
+                    db-sync/attach-ws-handlers! (fn [repo _client ws url _opened?]
                                                   (swap! attach-calls conj {:repo repo :ws ws :url url}))]
         (let [connected (#'db-sync/connect! test-repo {:repo test-repo} "wss://example.com/sync/graph-1")
               ws (:ws connected)]
