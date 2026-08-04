@@ -134,6 +134,53 @@
       (is (empty? conflicts) "no :block/uuid, so nothing the conflict table can hold")
       (is (= 1 (:unresolved-conflicts stats)) "but it is counted, not silently dropped"))))
 
+(deftest identity-datoms-selects-cross-graph-identity-test
+  (let [datoms [{:e 1 :a :block/uuid :v uuid-a}
+                {:e 1 :a :block/title :v "t"}
+                {:e 2 :a :db/ident :v :logseq.kv/graph-uuid}
+                {:e 2 :a :block/parent :v 1}]]
+    (is (= [{:e 1 :a :block/uuid :v uuid-a}
+            {:e 2 :a :db/ident :v :logseq.kv/graph-uuid}]
+           (sync-merge/identity-datoms datoms)))))
+
+(deftest new-entity-tx-data-only-covers-unknown-entities-test
+  (let [db (local-db [{:block/uuid uuid-a :block/title "known"}])
+        index (sync-merge/index-remote-datoms
+               [{:e 700 :a :block/uuid :v uuid-a}
+                {:e 800 :a :block/uuid :v uuid-b}])
+        shells (sync-merge/new-entity-tx-data db index)]
+    (is (= [{:block/uuid uuid-b}] shells)
+        "the entity already present locally gets no shell")))
+
+(deftest batched-merge-resolves-refs-across-batches-test
+  (testing "a ref whose target lands in a later batch still resolves"
+    (let [db (local-db [])
+          all-datoms [{:e 700 :a :block/uuid :v uuid-a}
+                      {:e 700 :a :block/title :v "child"}
+                      ;; the ref target's own datoms come in a *later* batch
+                      {:e 800 :a :block/uuid :v uuid-b}
+                      {:e 800 :a :block/title :v "parent"}]
+          index (sync-merge/index-remote-datoms (sync-merge/identity-datoms all-datoms))
+          ;; phase A: shells for everything the local graph lacks
+          conn (d/conn-from-db db)
+          _ (d/transact! conn (vec (sync-merge/new-entity-tx-data @conn index)))
+          mapping (sync-merge/build-id-mapping @conn index (distinct (map :e all-datoms)))
+          ;; phase B: reconcile in batches, ref datom in the first batch
+          batches [[{:e 700 :a :block/parent :v 800}]
+                   all-datoms]]
+      (doseq [batch batches]
+        (let [{:keys [tx-data]} (sync-merge/reconcile @conn batch
+                                                      {:schema schema
+                                                       :remote-t 7
+                                                       :index index
+                                                       :mapping mapping})]
+          (when (seq tx-data) (d/transact! conn tx-data))))
+      (let [child (d/entity @conn [:block/uuid uuid-a])]
+        (is (= "child" (:block/title child)))
+        (is (= (:db/id (d/entity @conn [:block/uuid uuid-b]))
+               (:db/id (:block/parent child)))
+            "ref resolved even though its target was reconciled in a later batch")))))
+
 (deftest non-string-divergence-is-counted-test
   (testing "a differing ref cannot be stored as a conflict, so it is reported"
     (let [db (local-db [{:block/uuid uuid-a :block/title "a"}

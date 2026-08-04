@@ -77,15 +77,43 @@
     (let [vs (into #{} (map :v) (d/datoms local-db :eavt eid a))]
       (when (seq vs) vs))))
 
+(defn identity-datoms
+  "The datoms that establish cross-graph identity. Neither attribute is in
+  encrypt-attr-set, so these can be read straight from the snapshot without
+  decrypting it."
+  [datoms]
+  (filter #(contains? #{:block/uuid :db/ident} (:a %)) datoms))
+
+(defn new-entity-tx-data
+  "Shell entities for remote entities the local graph doesn't have yet.
+
+  Merging runs in batches, and a tempid only holds within one transaction, so
+  refs spanning batches would dangle. Creating the shells up front means every
+  remote entity resolves to a real local id for the rest of the merge."
+  [local-db {:keys [e->uuid e->ident] :as index}]
+  (concat
+   (keep (fn [[e uuid']]
+           (when-not (local-eid local-db index e)
+             {:block/uuid uuid'}))
+         e->uuid)
+   (keep (fn [[e ident]]
+           (when-not (local-eid local-db index e)
+             {:db/ident ident}))
+         e->ident)))
+
 (defn reconcile
   "Reconcile snapshot `datoms` into `local-db`.
 
   Returns {:tx-data [...] :conflicts [...] :stats {...}}. `:conflicts` matches
   what client-op/add-sync-conflicts! expects; only string values can be recorded
-  there, so non-string divergences are counted in `:stats` instead of vanishing."
-  [local-db datoms {:keys [schema remote-t]}]
-  (let [index (index-remote-datoms datoms)
-        mapping (build-id-mapping local-db index (distinct (map :e datoms)))
+  there, so non-string divergences are counted in `:stats` instead of vanishing.
+
+  `:index` and `:mapping` may be supplied when merging in batches, where they
+  have to be built from the whole snapshot rather than the batch at hand."
+  [local-db datoms {:keys [schema remote-t] :as opts}]
+  (let [index (or (:index opts) (index-remote-datoms datoms))
+        mapping (or (:mapping opts)
+                    (build-id-mapping local-db index (distinct (map :e datoms))))
         init {:tx-data (transient [])
               :conflicts (transient [])
               :stats {:added 0 :unchanged 0 :conflicts 0

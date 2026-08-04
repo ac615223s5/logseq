@@ -12,6 +12,7 @@
    [frontend.worker.sync.client-op :as client-op]
    [frontend.worker.sync.crypt :as sync-crypt]
    [frontend.worker.sync.log-and-state :as rtc-log-and-state]
+   [frontend.worker.sync.merge :as sync-merge]
    [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
    [frontend.worker.sync.util :refer [fail-fast] :as sync-util]
    [lambdaisland.glogi :as log]
@@ -385,6 +386,56 @@
               (p/recur remaining')))
           (p/resolved nil))))))
 
+(defn- <decrypt-datoms
+  [aes-key graph-e2ee? datoms]
+  (if graph-e2ee?
+    (sync-crypt/<decrypt-snapshot-datoms-batch aes-key datoms)
+    (p/resolved datoms)))
+
+(defn <merge-imported-rows!
+  "Reconcile the staged snapshot into the live graph instead of replacing it.
+
+  Runs in two passes. Identity attributes aren't encrypted, so the first pass
+  reads :block/uuid and :db/ident straight from the snapshot to index it and
+  create shells for entities this graph has never seen - tempids only hold
+  within one transaction, so without real ids up front any ref spanning a batch
+  would dangle. The second pass decrypts and reconciles batch by batch against
+  the live db, keeping local values where both sides diverge and collecting the
+  remote ones as conflicts.
+
+  Returns {:conflicts [...] :stats {...}}."
+  [{:keys [conn rows-db aes-key graph-e2ee? graph-id import-id]} remote-t]
+  (if (nil? rows-db)
+    (p/resolved {:conflicts [] :stats {}})
+    (let [source-storage (sync-temp-sqlite/new-temp-sqlite-storage rows-db)
+          source-conn (common-sqlite/get-storage-conn source-storage db-schema/schema)
+          all-datoms (snapshot-datoms-in-import-order source-conn)
+          index (sync-merge/index-remote-datoms (sync-merge/identity-datoms all-datoms))
+          shells (sync-merge/new-entity-tx-data @conn index)]
+      (p/let [_ (when (seq shells)
+                  (d/transact! conn (vec shells) {:sync-download-graph? true}))
+              mapping (sync-merge/build-id-mapping @conn index (distinct (map :e all-datoms)))]
+        (p/loop [remaining (seq all-datoms)
+                 conflicts []
+                 stats {}]
+          (if (seq remaining)
+            (let [[batch remaining'] (take-import-datoms-batch remaining snapshot-import-datoms-batch-size)]
+              (p/let [batch' (<decrypt-datoms aes-key graph-e2ee? batch)
+                      {:keys [tx-data] :as result}
+                      (sync-merge/reconcile @conn batch'
+                                            {:schema db-schema/schema
+                                             :remote-t remote-t
+                                             :index index
+                                             :mapping mapping})
+                      _ (when (seq tx-data)
+                          (d/transact! conn tx-data {:sync-download-graph? true}))
+                      _ (log-import-progress! graph-id import-id (count batch))
+                      _ (<yield-next-tick)]
+                (p/recur remaining'
+                         (into conflicts (:conflicts result))
+                         (merge-with + stats (:stats result)))))
+            (p/resolved {:conflicts conflicts :stats stats})))))))
+
 (defn prepare-import!
   [repo reset? graph-id graph-e2ee? & [total-datoms]]
   (let [graph-e2ee? (if (nil? graph-e2ee?) true (true? graph-e2ee?))]
@@ -560,3 +611,95 @@
                            {:repo repo
                             :graph-id graph-id
                             :base base})))))
+
+(defn merge-graph-by-id!
+  "Link this graph to an existing remote graph without discarding either side.
+
+  Same fetch as download-graph-by-id!, but the local db is never closed or
+  unlinked: the snapshot is staged and then reconciled into the live graph, so
+  local-only content survives and divergent edits become conflicts the user can
+  resolve. Returns the download result plus :conflicts and :stats."
+  [repo graph-id graph-e2ee?]
+  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+    (if-not (and (seq repo) (seq graph-id) (seq base))
+      (p/rejected (ex-info "db-sync missing graph merge info"
+                           {:repo repo :graph-id graph-id :base base}))
+      (let [stage* (atom :init)
+            import-id* (atom nil)
+            log-f (fn [payload]
+                    (rtc-log-and-state/rtc-log :rtc.log/download payload))]
+        (-> (p/let [_ (log-f {:sub-type :download-progress
+                              :graph-uuid graph-id
+                              :message "Preparing graph merge"})
+                    _ (reset! stage* :fetch-pull)
+                    pull-resp (fetch-json (str base "/sync/" graph-id "/pull")
+                                          {:method "GET"}
+                                          :sync/pull)
+                    remote-tx (:t pull-resp)
+                    _ (when-not (integer? remote-tx)
+                        (throw (ex-info "non-integer remote-tx when merging graph"
+                                        {:repo repo :remote-tx remote-tx})))
+                    _ (reset! stage* :fetch-snapshot-download)
+                    snapshot-resp (fetch-json (str base "/sync/" graph-id "/snapshot/download")
+                                              {:method "GET"}
+                                              :sync/snapshot-download)
+                    _ (when graph-e2ee?
+                        (reset! stage* :prepare-e2ee)
+                        (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
+                    _ (reset! stage* :fetch-snapshot-stream)
+                    resp (js/fetch (:url snapshot-resp)
+                                   (clj->js (with-auth-headers {:method "GET"})))]
+              (when-not (.-ok resp)
+                (throw (ex-info "snapshot download failed"
+                                {:repo repo :status (.-status resp)})))
+              (let [ensure-import!
+                    (fn []
+                      (if-let [import-id @import-id*]
+                        (p/resolved import-id)
+                        (p/let [_ (reset! stage* :prepare-import)
+                                ;; reset? false - the live graph stays open
+                                {:keys [import-id]} (prepare-import! repo false graph-id graph-e2ee?)]
+                          (reset! import-id* import-id)
+                          import-id)))]
+                (p/let [_ (do
+                            (reset! stage* :stream-snapshot)
+                            (<stream-snapshot-row-batches!
+                             resp
+                             25000
+                             (fn [rows]
+                               (p/let [import-id (ensure-import!)]
+                                 (import-rows-chunk! rows graph-id import-id)))))
+                        _ (reset! stage* :reconcile)
+                        state (when-let [import-id @import-id*]
+                                (require-import-state! repo graph-id import-id))
+                        {:keys [conflicts stats]} (if state
+                                                    (<merge-imported-rows! state remote-tx)
+                                                    (p/resolved {:conflicts [] :stats {}}))
+                        _ (when (seq conflicts)
+                            (client-op/add-sync-conflicts! repo conflicts))
+                        _ (when-let [import-id @import-id*]
+                            (clear-import-state! import-id))
+                        _ (client-op/update-local-tx repo remote-tx)]
+                  (when-let [conn (worker-state/get-datascript-conn repo)]
+                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?))
+                  (log/info :db-sync/merge-graph-completed
+                            {:repo repo :graph-id graph-id :remote-tx remote-tx
+                             :conflict-count (count conflicts) :stats stats})
+                  (log-f {:sub-type :download-completed
+                          :graph-uuid graph-id
+                          :message "Graph merged"})
+                  {:repo repo
+                   :graph-id graph-id
+                   :remote-tx remote-tx
+                   :graph-e2ee? graph-e2ee?
+                   :conflicts conflicts
+                   :stats stats})))
+            (p/catch (fn [error]
+                       (when-let [import-id @import-id*]
+                         (clear-import-state! import-id))
+                       (log/error :db-sync/merge-graph-by-id-failed
+                                  {:repo repo
+                                   :graph-id graph-id
+                                   :stage @stage*
+                                   :error error})
+                       (throw error))))))))
