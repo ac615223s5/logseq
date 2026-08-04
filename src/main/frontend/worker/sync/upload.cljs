@@ -234,9 +234,14 @@
 (defn- set-graph-sync-metadata!
   [repo graph-id graph-e2ee?]
   (when-let [conn (worker-state/get-datascript-conn repo)]
-    (ldb/transact! conn [(ldb/kv :logseq.kv/graph-uuid (graph-id->uuid repo graph-id))
-                         (ldb/kv :logseq.kv/graph-remote? true)
-                         (ldb/kv :logseq.kv/graph-rtc-e2ee? (true? graph-e2ee?))]
+    (ldb/transact! conn (cond-> [(ldb/kv :logseq.kv/graph-uuid (graph-id->uuid repo graph-id))
+                                 (ldb/kv :logseq.kv/graph-remote? true)
+                                 (ldb/kv :logseq.kv/graph-rtc-e2ee? (true? graph-e2ee?))]
+                          ;; the name is the half of the link that survives a
+                          ;; server change; the uuid is per-server
+                          (seq (common-config/strip-leading-db-version-prefix repo))
+                          (conj (ldb/kv :logseq.kv/graph-remote-name
+                                        (common-config/strip-leading-db-version-prefix repo))))
       {:outliner-op :set-kvs})))
 
 (defn- persist-upload-graph-identity!

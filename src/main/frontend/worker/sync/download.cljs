@@ -16,6 +16,7 @@
    [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
    [frontend.worker.sync.util :refer [fail-fast] :as sync-util]
    [lambdaisland.glogi :as log]
+   [logseq.common.config :as common-config]
    [logseq.db-sync.snapshot :as snapshot]
    [logseq.db.common.sqlite :as common-sqlite]
    [logseq.db.frontend.schema :as db-schema]
@@ -509,11 +510,15 @@
                  (throw error)))))
 
 (defn- set-graph-sync-metadata!
-  [conn graph-id graph-e2ee?]
+  [conn graph-id graph-e2ee? graph-name]
   (assert (uuid? graph-id))
-  (ldb/transact! conn [(ldb/kv :logseq.kv/graph-uuid graph-id)
-                       (ldb/kv :logseq.kv/graph-remote? true)
-                       (ldb/kv :logseq.kv/graph-rtc-e2ee? (true? graph-e2ee?))]
+  (ldb/transact! conn (cond-> [(ldb/kv :logseq.kv/graph-uuid graph-id)
+                               (ldb/kv :logseq.kv/graph-remote? true)
+                               (ldb/kv :logseq.kv/graph-rtc-e2ee? (true? graph-e2ee?))]
+                        ;; the name is the half of the link that survives a
+                        ;; server change; the uuid is per-server
+                        (seq graph-name)
+                        (conj (ldb/kv :logseq.kv/graph-remote-name graph-name)))
     {:persist-op? false}))
 
 (defn download-graph-by-id!
@@ -575,7 +580,8 @@
                             (reset! stage* :finalize-import)
                             (finalize-import! repo graph-id remote-tx import-id))]
                   (when-let [conn (worker-state/get-datascript-conn repo)]
-                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?))
+                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?
+                                              (common-config/strip-leading-db-version-prefix repo)))
                   {:repo repo
                    :graph-id graph-id
                    :remote-tx remote-tx
@@ -681,7 +687,8 @@
                             (clear-import-state! import-id))
                         _ (client-op/update-local-tx repo remote-tx)]
                   (when-let [conn (worker-state/get-datascript-conn repo)]
-                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?))
+                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?
+                                              (common-config/strip-leading-db-version-prefix repo)))
                   (log/info :db-sync/merge-graph-completed
                             {:repo repo :graph-id graph-id :remote-tx remote-tx
                              :conflict-count (count conflicts) :stats stats})

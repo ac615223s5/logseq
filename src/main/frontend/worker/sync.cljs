@@ -15,6 +15,7 @@
    [frontend.worker.sync.util :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
+   [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
    [promesa.core :as p]))
 
@@ -262,12 +263,24 @@
         (reset! *checked? true)
         (-> (p/let [graphs (sync-upload/list-remote-graphs!)
                     graph-id (str (:graph-id client))
-                    remote-ids (set (keep #(some-> (:graph-id %) str) graphs))]
+                    remote-ids (set (keep #(some-> (:graph-id %) str) graphs))
+                    remote-name (some-> (worker-state/get-datascript-conn repo)
+                                        deref
+                                        ldb/get-graph-remote-name)
+                    ;; The name the user picked is stable across servers, so a
+                    ;; remote graph carrying it is the one they meant - offered
+                    ;; as a re-link candidate, never bound to silently.
+                    same-name-id (when (seq remote-name)
+                                   (some (fn [{:keys [graph-name graph-id]}]
+                                           (when (= remote-name graph-name) graph-id))
+                                         graphs))]
               (if (contains? remote-ids graph-id)
                 false
-                (let [data {:repo repo
-                            :graph-uuid graph-id
-                            :remote-graph-ids (vec remote-ids)}]
+                (let [data (cond-> {:repo repo
+                                    :graph-uuid graph-id
+                                    :remote-graph-ids (vec remote-ids)}
+                             (seq remote-name) (assoc :remote-graph-name remote-name)
+                             (seq same-name-id) (assoc :relink-candidate-graph-id same-name-id))]
                   (log/error :db-sync/graph-not-on-server data)
                   (sync-util/set-last-sync-error!
                    client
