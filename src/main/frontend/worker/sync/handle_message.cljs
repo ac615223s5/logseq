@@ -12,8 +12,7 @@
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
-            [promesa.core :as p]
-            [frontend.worker-common.util :as worker-util]))
+            [promesa.core :as p]))
 
 (defn- fail-fast
   [tag data]
@@ -147,22 +146,36 @@
        (string? (client-op/get-local-checksum repo))))
 
 (defn- verify-sync-checksum!
+  "Compare local and remote content once the tx counters agree.
+
+  Matching counters only prove every transaction was consumed; they say nothing
+  about whether the content matches. A client attached to a graph's tx stream
+  without its base snapshot sits at the same t as the server while missing
+  everything the snapshot held, and reports itself fully synced - remote data
+  stays missing with no indication anything is wrong.
+
+  The checksums exist to catch exactly that, so this runs in every build, not
+  just dev, and records a sync error rather than only logging: `pending-server`
+  is arithmetic on the counters and cannot represent this state."
   [repo client local-tx remote-tx remote-checksum context]
-  (when worker-util/dev-or-test?
-    (when (and (string? remote-checksum)
-               (checksum-compare-ready? repo client local-tx remote-tx))
-      (let [local-checksum (client-op/get-local-checksum repo)]
-        (when-not (= local-checksum remote-checksum)
-          (let [mismatch-data (merge context
-                                     {:type :db-sync/checksum-mismatch
-                                      :repo repo
-                                      :message-type (:type context)
-                                      :local-tx local-tx
-                                      :remote-tx remote-tx
-                                      :local-checksum local-checksum
-                                      :remote-checksum remote-checksum})]
-            (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
-            (log/warn :db-sync/checksum-mismatch mismatch-data)))))))
+  (when (and (string? remote-checksum)
+             (checksum-compare-ready? repo client local-tx remote-tx))
+    (let [local-checksum (client-op/get-local-checksum repo)]
+      (when-not (= local-checksum remote-checksum)
+        (let [mismatch-data (merge context
+                                   {:type :db-sync/checksum-mismatch
+                                    :repo repo
+                                    :message-type (:type context)
+                                    :local-tx local-tx
+                                    :remote-tx remote-tx
+                                    :local-checksum local-checksum
+                                    :remote-checksum remote-checksum})]
+          (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
+          (log/error :db-sync/checksum-mismatch mismatch-data)
+          (sync-util/set-last-sync-error!
+           client
+           (ex-info "local graph diverges from the server: all transactions applied but content differs; re-download the remote graph to resync"
+                    (assoc mismatch-data :code :db-sync/checksum-mismatch))))))))
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
