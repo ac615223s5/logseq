@@ -733,6 +733,8 @@
  :graph/no-selected-node "No graph node selected."
  :graph/node-count (fn [n] (str n " " (if (= 1 n) "node" "nodes")))
  :graph/open-folder-action "Open graph folder"
+ :graph/merge-with-server-action "Merge with server copy"
+ :graph/merge-with-server-confirm "Merge \"{1}\" with the server copy?"
  :graph/open-in-another-tab-action "Open in another tab"
  :graph/open-remote-graph-desc "You already have a local graph called \"{1}\". Choose what to do with it."
  :graph/open-remote-graph-title "Open \"{1}\" from the server"

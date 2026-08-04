@@ -259,6 +259,26 @@
                               (delete-local-graph! repo))}
                 (t :graph/delete-local-action))))
 
+           ;; An already-linked graph shows as a single row, so the merge choice
+           ;; offered when opening a remote graph never reaches it. This is how
+           ;; a linked graph that has drifted from the server gets reconciled
+           ;; without discarding either side.
+           (when (and root remote? GraphUUID)
+             (shui/dropdown-menu-item
+              {:key "merge-with-server"
+               :class "merge-with-server-menu-item"
+               :on-click (fn []
+                           (-> (shui/dialog-confirm!
+                                [:p (t :sync/merge-description)]
+                                (merge dialog-config
+                                       {:title (t :graph/merge-with-server-confirm GraphName)}))
+                               (p/then
+                                (fn []
+                                  (state/pub-event! [:rtc/merge-remote-graph
+                                                     GraphName GraphUUID
+                                                     GraphSchemaVersion graph-e2ee?])))))}
+              (t :graph/merge-with-server-action)))
+
            (when (and root
                       (user-handler/logged-in?)
                       (user-handler/rtc-group?)
