@@ -89,17 +89,20 @@
 
   Merging runs in batches, and a tempid only holds within one transaction, so
   refs spanning batches would dangle. Creating the shells up front means every
-  remote entity resolves to a real local id for the rest of the merge."
+  remote entity resolves to a real local id for the rest of the merge.
+
+  One shell per remote entity, carrying every identity attribute it has: schema
+  and kv entities hold both :db/ident and a :block/uuid derived from it, and
+  emitting a shell per index would create two entities for one thing and then
+  trip the :block/uuid unique constraint."
   [local-db {:keys [e->uuid e->ident] :as index}]
-  (concat
-   (keep (fn [[e uuid']]
-           (when-not (local-eid local-db index e)
-             {:block/uuid uuid'}))
-         e->uuid)
-   (keep (fn [[e ident]]
-           (when-not (local-eid local-db index e)
-             {:db/ident ident}))
-         e->ident)))
+  (->> (into #{} (concat (keys e->uuid) (keys e->ident)))
+       (keep (fn [e]
+               (when-not (local-eid local-db index e)
+                 (cond-> {}
+                   (contains? e->uuid e) (assoc :block/uuid (get e->uuid e))
+                   (contains? e->ident e) (assoc :db/ident (get e->ident e))))))
+       (remove empty?)))
 
 (defn reconcile
   "Reconcile snapshot `datoms` into `local-db`.

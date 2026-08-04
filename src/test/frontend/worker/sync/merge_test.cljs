@@ -152,6 +152,20 @@
     (is (= [{:block/uuid uuid-b}] shells)
         "the entity already present locally gets no shell")))
 
+(deftest entity-with-both-identities-gets-one-shell-test
+  (testing "schema and kv entities carry :db/ident and a derived :block/uuid"
+    (let [db (local-db [])
+          index (sync-merge/index-remote-datoms
+                 [{:e 555 :a :db/ident :v :logseq.kv/graph-uuid}
+                  {:e 555 :a :block/uuid :v uuid-a}])
+          shells (sync-merge/new-entity-tx-data db index)]
+      (is (= [{:block/uuid uuid-a :db/ident :logseq.kv/graph-uuid}] shells)
+          "one shell carrying both identities, not one per index")
+      ;; two shells would trip the :block/uuid unique constraint on transact
+      (let [conn (d/conn-from-db db)]
+        (d/transact! conn (vec shells))
+        (is (= 1 (count (d/datoms @conn :avet :block/uuid))))))))
+
 (deftest batched-merge-resolves-refs-across-batches-test
   (testing "a ref whose target lands in a later batch still resolves"
     (let [db (local-db [])
