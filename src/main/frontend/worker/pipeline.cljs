@@ -397,11 +397,11 @@
 
 (defn- gen-created-by-block
   [decoded-id-token]
-  (let [user-uuid (:sub decoded-id-token)
+  (let [user-uuid (common-uuid/user-id->uuid (:sub decoded-id-token))
         user-name (:cognito:username decoded-id-token)
         email (:email decoded-id-token)
         now (common-util/time-ms)]
-    {:block/uuid (uuid user-uuid)
+    {:block/uuid user-uuid
      :block/name user-name
      :block/title user-name
      :block/tags :logseq.class/Page
@@ -415,35 +415,36 @@
   (when (and (not (or (:undo? tx-meta) (:redo? tx-meta) (rtc-tx-or-download-graph? tx-meta)))
              (seq tx-data))
     (when-let [decoded-id-token (some-> (worker-state/get-id-token) worker-util/parse-jwt)]
-      (let [created-by-ent (d/entity db-after [:block/uuid (uuid (:sub decoded-id-token))])
-            created-by-block (when (nil? created-by-ent)
-                               (assoc (gen-created-by-block decoded-id-token) :db/id "created-by-id"))
-            created-by-id (or (:db/id created-by-ent) "created-by-id")
-            add-created-by-tx-data
-            (keep
-             (fn [datom]
-               (let [attr (:a datom)
-                     value (:v datom)
-                     e (:e datom)]
-                 (cond
-                   ;; add created-by for new-block
-                   (and (keyword-identical? :block/uuid attr)
-                        (:added datom))
-                   (when-let [ent (d/entity db-after e)]
-                     (when-not (:logseq.property/created-by-ref ent)
-                       [:db/add e :logseq.property/created-by-ref created-by-id]))
+      (when-let [user-uuid (common-uuid/user-id->uuid (:sub decoded-id-token))]
+        (let [created-by-ent (d/entity db-after [:block/uuid user-uuid])
+              created-by-block (when (nil? created-by-ent)
+                                 (assoc (gen-created-by-block decoded-id-token) :db/id "created-by-id"))
+              created-by-id (or (:db/id created-by-ent) "created-by-id")
+              add-created-by-tx-data
+              (keep
+               (fn [datom]
+                 (let [attr (:a datom)
+                       value (:v datom)
+                       e (:e datom)]
+                   (cond
+                     ;; add created-by for new-block
+                     (and (keyword-identical? :block/uuid attr)
+                          (:added datom))
+                     (when-let [ent (d/entity db-after e)]
+                       (when-not (:logseq.property/created-by-ref ent)
+                         [:db/add e :logseq.property/created-by-ref created-by-id]))
 
-                   ;; update created-by when block change from empty-block-title to non-empty
-                   (and (keyword-identical? :block/title attr)
-                        (not (string/blank? value))
-                        (let [origin-title (:block/title (d/entity db-before e))]
-                          (and (some? origin-title)
-                               (string/blank? origin-title))))
-                   (when (d/entity db-after e)
-                     [:db/add e :logseq.property/created-by-ref created-by-id]))))
-             tx-data)]
-        (cond->> add-created-by-tx-data
-          (nil? created-by-ent) (cons created-by-block))))))
+                     ;; update created-by when block change from empty-block-title to non-empty
+                     (and (keyword-identical? :block/title attr)
+                          (not (string/blank? value))
+                          (let [origin-title (:block/title (d/entity db-before e))]
+                            (and (some? origin-title)
+                                 (string/blank? origin-title))))
+                     (when (d/entity db-after e)
+                       [:db/add e :logseq.property/created-by-ref created-by-id]))))
+               tx-data)]
+          (cond->> add-created-by-tx-data
+            (nil? created-by-ent) (cons created-by-block)))))))
 
 (defn- revert-disallowed-changes
   [{:keys [tx-meta tx-data db-before db-after]}]

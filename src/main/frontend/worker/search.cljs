@@ -576,10 +576,18 @@ DROP TRIGGER IF EXISTS blocks_au;
              (and (string? title) (> (count title) 10000))
              (string/blank? title))        ; empty page or block
     (try
-      (let [title (block-search-title block)]
-        (when uuid
-          (cond-> {:id (str uuid)
-                   :page (str (or (:block/uuid page) uuid))
+      (let [title (block-search-title block)
+            id (str uuid)
+            page-id (str (or (:block/uuid page) uuid))]
+        ;; Entities whose :block/uuid isn't uuid-shaped (e.g. a created-by user
+        ;; block keyed by a raw sync user id) are rejected by upsert-blocks!,
+        ;; which aborts the whole batch and takes the tx apply down with it.
+        ;; Drop them here so one bad entity can't stall indexing or sync.
+        (when (and uuid
+                   (common-util/uuid-string? id)
+                   (common-util/uuid-string? page-id))
+          (cond-> {:id id
+                   :page page-id
                    :title (if (page-or-object? block) title (sanitize title))}
             include-vector-title?
             (assoc :vector-title title))))
