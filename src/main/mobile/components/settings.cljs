@@ -35,11 +35,14 @@
        (shui/button
         {:variant :default
          :class "text-1xl flex flex-1 w-full my-8"
+         ;; Account-less sync: the passphrase form, not the Cognito authenticator.
+         ;; Desktop reaches this via login/open-login-modal!; mobile has no header
+         ;; menu, so the settings button is the only entry point.
          :on-click #(shui/popup-show!
                      nil
                      (fn []
-                       [:div.w-full.h-full
-                        (login/page-impl)])
+                       [:div.w-full
+                        (login/sync-key-form)])
                      {:id :login})}
         (t :ui/login))
        ;; Logged in: account cell
