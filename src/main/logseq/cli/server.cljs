@@ -299,7 +299,7 @@
                                    (-> (profile/time! profile-session
                                                       "server.wait-lock"
                                                       (fn []
-                                                        (wait-for-lock path {:pid (some-> child .-pid)})))
+                                                        (wait-for-lock path {:pid (some-> ^js child .-pid)})))
                                        (p/catch (fn [e]
                                                   (let [code (:code (ex-data e))]
                                                     (if (contains? #{:timeout :spawn-exited} code)
