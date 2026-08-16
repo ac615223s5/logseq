@@ -319,3 +319,49 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally (fn [] (done)))))))
+
+(deftest ensure-started-shares-concurrent-starts-for-same-repo
+  (async done
+    (let [start-calls (atom [])
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo]
+                                     (swap! start-calls conj repo)
+                                     ;; a real start is slow enough for a second
+                                     ;; request to arrive before it resolves
+                                     (p/let [_ (p/delay 30)]
+                                       (runtime repo)))
+                    :stop-daemon! (fn [_] (p/resolved true))})]
+      (-> (p/let [runtimes (p/all [(db-worker/ensure-started! manager "graph-a" :window-1)
+                                   (db-worker/ensure-started! manager "graph-a" :window-2)])
+                  state @(:state manager)]
+            (is (= ["graph-a"] @start-calls))
+            (is (apply = runtimes))
+            (is (= #{:window-1 :window-2} (get-in state [:repos "graph-a" :windows])))
+            (is (empty? @(:starting manager))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn [] (done)))))))
+
+(deftest ensure-started-retries-after-a-failed-start
+  (async done
+    (let [start-calls (atom 0)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo]
+                                     (swap! start-calls inc)
+                                     (if (= 1 @start-calls)
+                                       (p/rejected (ex-info "start failed" {}))
+                                       (p/resolved (runtime repo))))
+                    :stop-daemon! (fn [_] (p/resolved true))})]
+      (-> (-> (db-worker/ensure-started! manager "graph-a" :window-1)
+              (p/catch (fn [_] :failed)))
+          (p/then (fn [result]
+                    (is (= :failed result))
+                    ;; a failed attempt must not leave the shared entry behind
+                    (is (empty? @(:starting manager)))
+                    (db-worker/ensure-started! manager "graph-a" :window-1)))
+          (p/then (fn [rt]
+                    (is (= 2 @start-calls))
+                    (is (= "graph-a" (:repo rt)))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn [] (done)))))))

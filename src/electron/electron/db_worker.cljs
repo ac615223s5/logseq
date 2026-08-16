@@ -109,7 +109,20 @@
    :start-daemon! start-daemon!
    :stop-daemon! stop-daemon!
    :runtime-ready? (or runtime-ready? (fn [_runtime] (p/resolved true)))
-   :state (atom (initial-state))})
+   :state (atom (initial-state))
+   :starting (atom {})})
+
+(defn- start-daemon-once!
+  "`ensure-started!` only records a runtime once `start-daemon!` resolves, so two
+  requests arriving for the same graph before that would each start a daemon.
+  Concurrent starters share the first attempt instead."
+  [{:keys [starting start-daemon!]} key repo]
+  (or (get @starting key)
+      (let [started (-> (p/resolved nil)
+                        (p/then (fn [_] (start-daemon! repo)))
+                        (p/finally (fn [] (swap! starting dissoc key))))]
+        (swap! starting assoc key started)
+        started)))
 
 (defn- owned-runtime?
   [runtime]
@@ -131,7 +144,7 @@
       (p/resolved false))))
 
 (defn ensure-started!
-  [{:keys [state start-daemon! stop-daemon! runtime-ready?] :as manager} repo window-id]
+  [{:keys [state stop-daemon! runtime-ready?] :as manager} repo window-id]
   (let [key (repo-key repo)]
     (p/let [current-repo (get-in (ensure-state @state) [:window->repo window-id])
             _ (when (and current-repo (not= current-repo key))
@@ -149,7 +162,7 @@
             (p/let [_ (when (owned-runtime? runtime)
                         (-> (stop-daemon! runtime)
                             (p/catch (fn [_] nil))))
-                    runtime' (start-daemon! repo)]
+                    runtime' (start-daemon-once! manager key repo)]
               (swap! state
                      (fn [current]
                        (let [current' (ensure-state current)
@@ -159,12 +172,14 @@
                                                      :windows (conj windows window-id)})
                              (assoc-in [:window->repo window-id] key)))))
               runtime')))
-        (p/let [runtime (start-daemon! repo)]
+        (p/let [runtime (start-daemon-once! manager key repo)]
           (swap! state (fn [current]
-                         (-> (ensure-state current)
-                             (assoc-in [:repos key] {:runtime runtime
-                                                     :windows #{window-id}})
-                             (assoc-in [:window->repo window-id] key))))
+                         (let [current' (ensure-state current)
+                               windows (get-in current' [:repos key :windows] #{})]
+                           (-> current'
+                               (assoc-in [:repos key] {:runtime runtime
+                                                       :windows (conj windows window-id)})
+                               (assoc-in [:window->repo window-id] key)))))
           runtime)))))
 
 (defn- parse-runtime-lock

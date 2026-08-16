@@ -202,20 +202,48 @@
    (fn [resolve reject]
      (let [start (js/Date.now)
            tick (fn tick []
-                  (p/let [ok? (pred-fn)]
-                    (if ok?
-                      (resolve true)
-                      (if (> (- (js/Date.now) start) timeout-ms)
-                        (reject (ex-info "timeout" {:code :timeout}))
-                        (js/setTimeout tick interval-ms)))))]
+                  (-> (p/let [ok? (pred-fn)]
+                        (if ok?
+                          (resolve true)
+                          (if (> (- (js/Date.now) start) timeout-ms)
+                            (reject (ex-info "timeout" {:code :timeout}))
+                            (js/setTimeout tick interval-ms))))
+                      ;; a throwing predicate used to leave this promise pending
+                      ;; forever; surface it to the caller instead
+                      (p/catch reject)))]
        (tick)))))
 
+(def ^:private lock-wait-timeout-ms 8000)
+
+;; A cold `db-worker-node` start pays for node boot plus reading the bundle, which
+;; on a slow/contended disk can take well over the plain timeout. As long as the
+;; process we spawned is still alive it is still making progress, so wait it out
+;; rather than declaring failure and leaving an orphan behind.
+(def ^:private spawned-lock-wait-timeout-ms 60000)
+
 (defn wait-for-lock
-  [path]
-  (wait-for (fn []
-              (p/resolved (fs/existsSync path)))
-            {:timeout-ms 8000
-             :interval-ms 50}))
+  ([path] (wait-for-lock path nil))
+  ([path {:keys [pid timeout-ms]}]
+   (let [spawned-pid (when (number? pid) pid)]
+     (wait-for (fn []
+                 (cond
+                   (fs/existsSync path)
+                   (p/resolved true)
+
+                   ;; the process we spawned exited without publishing a lock, so
+                   ;; no amount of further waiting will help
+                   (and spawned-pid (process-stopped? spawned-pid))
+                   (p/rejected (ex-info "db-worker-node exited before creating lock"
+                                        {:code :spawn-exited
+                                         :pid spawned-pid}))
+
+                   :else
+                   (p/resolved false)))
+               {:timeout-ms (or timeout-ms
+                                (if spawned-pid
+                                  spawned-lock-wait-timeout-ms
+                                  lock-wait-timeout-ms))
+                :interval-ms 50}))))
 
 (defn wait-for-ready
   [lock]

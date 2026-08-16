@@ -195,3 +195,58 @@
         (p/catch (fn [e]
                    (is false (str "unexpected error: " e))))
         (p/finally done))))
+
+(deftest wait-for-propagates-predicate-errors
+  (async done
+    (-> (daemon/wait-for (fn [] (p/rejected (ex-info "boom" {:code :boom})))
+                         {:timeout-ms 500 :interval-ms 10})
+        (p/then (fn [_]
+                  (is false "a rejecting predicate must not resolve wait-for")))
+        (p/catch (fn [e]
+                   (is (= :boom (:code (ex-data e))))))
+        (p/finally done))))
+
+(deftest wait-for-lock-fails-fast-when-spawned-process-exited
+  (async done
+    (let [tmp-dir (node-helper/create-tmp-dir "daemon-lock-exit")
+          lock-path (node-path/join tmp-dir "db-worker.lock")
+          started (js/Date.now)]
+      (-> (p/with-redefs [daemon/pid-status (fn [_pid] :not-found)]
+            (daemon/wait-for-lock lock-path {:pid 987654}))
+          (p/then (fn [_]
+                    (is false "must not resolve when the spawned process is gone")))
+          (p/catch (fn [e]
+                     (is (= :spawn-exited (:code (ex-data e))))
+                     ;; the point of the check: give up immediately instead of
+                     ;; burning the whole spawn timeout
+                     (is (< (- (js/Date.now) started) 5000))))
+          (p/finally done)))))
+
+(deftest wait-for-lock-prefers-an-existing-lock-over-process-liveness
+  (async done
+    (let [tmp-dir (node-helper/create-tmp-dir "daemon-lock-exists")
+          lock-path (node-path/join tmp-dir "db-worker.lock")]
+      (fs/writeFileSync lock-path (js/JSON.stringify #js {:repo "logseq_db_demo"}))
+      (-> (p/with-redefs [daemon/pid-status (fn [_pid] :not-found)]
+            (daemon/wait-for-lock lock-path {:pid 987654}))
+          (p/then (fn [result]
+                    (is (= true result))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest wait-for-lock-resolves-when-a-live-process-publishes-late
+  (async done
+    (let [tmp-dir (node-helper/create-tmp-dir "daemon-lock-slow")
+          lock-path (node-path/join tmp-dir "db-worker.lock")]
+      ;; a spawned process that is still alive keeps being waited on, however long
+      ;; it takes to publish
+      (js/setTimeout (fn []
+                       (fs/writeFileSync lock-path (js/JSON.stringify #js {:repo "logseq_db_demo"})))
+                     200)
+      (-> (daemon/wait-for-lock lock-path {:pid (.-pid js/process)})
+          (p/then (fn [result]
+                    (is (= true result))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))

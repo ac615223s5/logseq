@@ -1204,3 +1204,117 @@
         (is (= "yy y" (:legacy-graph-name legacy-item)))
         (is (= "yy y" (:target-graph-dir legacy-item)))
         (is (= true (:conflict? legacy-item)))))))
+
+(deftest ensure-server-shares-concurrent-starts-for-same-repo
+  (async done
+    (let [root-dir (node-helper/create-tmp-dir "cli-server-concurrent")
+          repo (str "logseq_db_concurrent_" (subs (str (random-uuid)) 0 8))
+          lock-file (cli-server/lock-path root-dir repo)
+          config-path (node-path/join root-dir "cli.edn")
+          server-list-file (cli-config/server-list-path root-dir)
+          host "127.0.0.1"
+          port* (atom nil)
+          spawn-calls (atom 0)
+          server (http/createServer
+                  (fn [^js req ^js res]
+                    (case (.-url req)
+                      "/healthz" (do (.writeHead res 200 #js {"Content-Type" "application/json"})
+                                     (.end res (js/JSON.stringify #js {:repo repo
+                                                                       :status "ready"
+                                                                       :host host
+                                                                       :port @port*
+                                                                       :pid (.-pid js/process)
+                                                                       :owner-source "electron"
+                                                                       :revision "server-revision"})))
+                      (do (.writeHead res 404 #js {"Content-Type" "text/plain"})
+                          (.end res "not-found")))))]
+      (.listen server 0 host
+               (fn []
+                 (let [address (.address server)
+                       port (if (number? address) address (.-port address))
+                       _ (reset! port* port)
+                       publish! (fn []
+                                  (fs/mkdirSync (node-path/dirname lock-file) #js {:recursive true})
+                                  (fs/writeFileSync lock-file
+                                                    (js/JSON.stringify (clj->js {:repo repo
+                                                                                 :pid (.-pid js/process)
+                                                                                 :lock-id "concurrent-lock"
+                                                                                 :owner-source :electron})))
+                                  (fs/writeFileSync server-list-file
+                                                    (str (.-pid js/process) " " port "\n")))
+                       config {:root-dir root-dir
+                               :config-path config-path
+                               :owner-source :electron
+                               :expected-revision "server-revision"}]
+                   (-> (p/with-redefs [daemon/spawn-server! (fn [_opts]
+                                                              (swap! spawn-calls inc)
+                                                              ;; the real daemon publishes its lock
+                                                              ;; well after spawn returns
+                                                              (js/setTimeout publish! 150)
+                                                              #js {:pid (.-pid js/process)})]
+                         (p/all [(cli-server/ensure-server! config repo)
+                                 (cli-server/ensure-server! config repo)]))
+                       (p/then (fn [[a b]]
+                                 ;; two starters for one graph must not race for the lock
+                                 (is (= 1 @spawn-calls))
+                                 (is (= (str "http://" host ":" port) (:base-url a)))
+                                 (is (= (:base-url a) (:base-url b)))))
+                       (p/catch (fn [e]
+                                  (is false (str "unexpected error: " e))))
+                       (p/finally (fn []
+                                    (.close server (fn [] (done))))))))))))
+
+(deftest ensure-server-adopts-the-winner-when-a-lock-race-is-lost
+  (async done
+    (let [root-dir (node-helper/create-tmp-dir "cli-server-lock-race")
+          repo (str "logseq_db_race_" (subs (str (random-uuid)) 0 8))
+          lock-file (cli-server/lock-path root-dir repo)
+          config-path (node-path/join root-dir "cli.edn")
+          server-list-file (cli-config/server-list-path root-dir)
+          host "127.0.0.1"
+          port* (atom nil)
+          server (http/createServer
+                  (fn [^js req ^js res]
+                    (case (.-url req)
+                      "/healthz" (do (.writeHead res 200 #js {"Content-Type" "application/json"})
+                                     (.end res (js/JSON.stringify #js {:repo repo
+                                                                       :status "ready"
+                                                                       :host host
+                                                                       :port @port*
+                                                                       :pid (.-pid js/process)
+                                                                       :owner-source "electron"
+                                                                       :revision "server-revision"})))
+                      (do (.writeHead res 404 #js {"Content-Type" "text/plain"})
+                          (.end res "not-found")))))]
+      (.listen server 0 host
+               (fn []
+                 (let [address (.address server)
+                       port (if (number? address) address (.-port address))
+                       _ (reset! port* port)
+                       ;; our spawn loses the race: it dies with :repo-locked while
+                       ;; another starter publishes a healthy server for this repo
+                       winner-publishes! (fn []
+                                           (fs/mkdirSync (node-path/dirname lock-file) #js {:recursive true})
+                                           (fs/writeFileSync lock-file
+                                                             (js/JSON.stringify (clj->js {:repo repo
+                                                                                          :pid (.-pid js/process)
+                                                                                          :lock-id "winner-lock"
+                                                                                          :owner-source :electron})))
+                                           (fs/writeFileSync server-list-file
+                                                             (str (.-pid js/process) " " port "\n")))]
+                   (-> (p/with-redefs [daemon/spawn-server! (fn [_opts] #js {:pid 987654})
+                                       daemon/wait-for-lock (fn [_path _opts]
+                                                              (winner-publishes!)
+                                                              (p/rejected (ex-info "exited"
+                                                                                   {:code :spawn-exited})))]
+                         (cli-server/ensure-server! {:root-dir root-dir
+                                                     :config-path config-path
+                                                     :owner-source :electron
+                                                     :expected-revision "server-revision"}
+                                                    repo))
+                       (p/then (fn [config]
+                                 (is (= (str "http://" host ":" port) (:base-url config)))))
+                       (p/catch (fn [e]
+                                  (is false (str "unexpected error: " e))))
+                       (p/finally (fn []
+                                    (.close server (fn [] (done))))))))))))

@@ -167,8 +167,8 @@
   (daemon/wait-for pred-fn opts))
 
 (defn- wait-for-lock
-  [path]
-  (daemon/wait-for-lock path))
+  ([path] (daemon/wait-for-lock path))
+  ([path opts] (daemon/wait-for-lock path opts)))
 
 (defn- wait-for-ready
   [lock]
@@ -287,25 +287,32 @@
                              discovered (discover-servers config)
                              discovered-repo-server (repo-server config discovered repo)
                              _ (when (and (not discovered-repo-server) (not (fs/existsSync path)))
-                                 (profile/time! profile-session
-                                                "server.spawn-daemon"
-                                                (fn []
-                                                  (spawn-server! {:repo repo
-                                                                  :root-dir root-dir
-                                                                  :owner-source requester-owner
-                                                                  :create-empty-db? (:create-empty-db? config)
-                                                                  :embedding-endpoint (:embedding-endpoint config)
-                                                                  :embedding-model-id (:embedding-model-id config)})))
-                                 (-> (profile/time! profile-session
-                                                    "server.wait-lock"
-                                                    (fn []
-                                                      (wait-for-lock path)))
-                                     (p/catch (fn [e]
-                                                (if (= :timeout (:code (ex-data e)))
-                                                  (throw (ex-info "db-worker-node failed to create lock"
-                                                                  {:code :server-start-timeout-orphan
-                                                                   :repo repo}))
-                                                  (throw e))))))
+                                 (p/let [child (profile/time! profile-session
+                                                              "server.spawn-daemon"
+                                                              (fn []
+                                                                (spawn-server! {:repo repo
+                                                                                :root-dir root-dir
+                                                                                :owner-source requester-owner
+                                                                                :create-empty-db? (:create-empty-db? config)
+                                                                                :embedding-endpoint (:embedding-endpoint config)
+                                                                                :embedding-model-id (:embedding-model-id config)})))]
+                                   (-> (profile/time! profile-session
+                                                      "server.wait-lock"
+                                                      (fn []
+                                                        (wait-for-lock path {:pid (some-> child .-pid)})))
+                                       (p/catch (fn [e]
+                                                  (let [code (:code (ex-data e))]
+                                                    (if (contains? #{:timeout :spawn-exited} code)
+                                                      ;; We may have lost a lock race: another starter can own the
+                                                      ;; lock and already be serving this repo. Prefer that server
+                                                      ;; over failing the caller.
+                                                      (p/let [servers (discover-servers config)]
+                                                        (when-not (repo-server config servers repo)
+                                                          (throw (ex-info "db-worker-node failed to create lock"
+                                                                          {:code :server-start-timeout-orphan
+                                                                           :repo repo
+                                                                           :reason code}))))
+                                                      (throw e))))))))
                              lock (read-lock path)
                              lock (if (and lock
                                            (= :cli requester-owner)
@@ -376,9 +383,30 @@
                                     :after-restart? true)]
               (throw (ex-info (:message error-data) error-data)))))))))
 
+;; Concurrent starts for the same graph used to each spawn their own
+;; db-worker-node; the loser of the resulting lock race died with :repo-locked and
+;; whichever caller was waiting on it failed. Callers now share a single attempt.
+(defonce ^:private *in-flight-starts (atom {}))
+
+(defn- start-key
+  [config repo]
+  (when-let [repo-id (graph-dir/repo-identity repo)]
+    (str (current-root-dir config) "::" repo-id)))
+
+(defn- ensure-server-started-shared!
+  [config repo]
+  (if-let [key (start-key config repo)]
+    (or (get @*in-flight-starts key)
+        (let [started (-> (p/resolved nil)
+                          (p/then (fn [_] (ensure-server-started! config repo)))
+                          (p/finally (fn [] (swap! *in-flight-starts dissoc key))))]
+          (swap! *in-flight-starts assoc key started)
+          started))
+    (ensure-server-started! config repo)))
+
 (defn ensure-server!
   [config repo]
-  (p/let [lock (ensure-server-started! config repo)]
+  (p/let [lock (ensure-server-started-shared! config repo)]
     (assoc config
            :base-url (base-url lock)
            :owner-source (:owner-source lock)

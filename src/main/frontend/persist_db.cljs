@@ -112,6 +112,26 @@
                 :reason :runtime-changed)
       (p/resolved false))))
 
+(def ^:private db-worker-recovery-max-attempts 3)
+(def ^:private db-worker-recovery-retry-delay-ms 1000)
+
+(defn- <ensure-remote-retrying!
+  "A runtime start can lose to something transient — a cold db-worker-node boot, a
+  lock race with another starter. Retry with backoff before failing the graph."
+  [repo attempts delay-ms]
+  (-> (<ensure-remote! repo {:only-if-current? true})
+      (p/catch (fn [error]
+                 (if (and (> attempts 1)
+                          (same-remote-repo? repo (state/get-current-repo)))
+                   (do
+                     (log/warn :event :db-worker-runtime-recovery-retry
+                               :repo repo
+                               :remaining-attempts (dec attempts)
+                               :error error)
+                     (p/let [_ (p/delay delay-ms)]
+                       (<ensure-remote-retrying! repo (dec attempts) (* 2 delay-ms))))
+                   (p/rejected error))))))
+
 (defn- <trigger-db-worker-runtime-recovery!
   [repo remote-client session-id]
   (log/warn :event :db-worker-runtime-recovering :repo repo)
@@ -127,7 +147,9 @@
       (p/then (fn [released?]
                 (if (and released?
                          (same-remote-repo? repo (state/get-current-repo)))
-                  (<ensure-remote! repo {:only-if-current? true})
+                  (<ensure-remote-retrying! repo
+                                            db-worker-recovery-max-attempts
+                                            db-worker-recovery-retry-delay-ms)
                   (when-not released?
                     (log/info :event :db-worker-runtime-recovery-skipped
                               :repo repo
