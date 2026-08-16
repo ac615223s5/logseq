@@ -2,6 +2,7 @@
   (:require ["fs" :as fs]
             ["os" :as os]
             ["path" :as node-path]
+            [cljs.reader :as reader]
             [cljs.test :refer [deftest is testing]]
             [frontend.test.node-helper :as node-helper]
             [logseq.cli.root-dir :as root-dir]))
@@ -53,3 +54,46 @@
     (let [root-dir-path (node-path/join (.homedir os) "custom-logseq")]
       (is (= (node-path/resolve root-dir-path "graphs")
              (root-dir/graphs-dir root-dir-path))))))
+
+(deftest cli-config-path-lives-under-default-root-dir
+  (testing "the CLI pointer stays under the default root, not the configured one"
+    (is (= (node-path/join (root-dir/default-root-dir) "cli.edn")
+           (root-dir/cli-config-path)))))
+
+(deftest with-root-dir-merges-and-clears
+  (testing "sets root-dir while preserving unrelated keys"
+    (is (= {:graph "demo" :root-dir "/tmp/notes"}
+           (root-dir/with-root-dir {:graph "demo"} "/tmp/notes"))))
+  (testing "a nil root-dir drops the key instead of writing nil"
+    (is (= {:graph "demo"}
+           (root-dir/with-root-dir {:graph "demo" :root-dir "/tmp/notes"} nil))))
+  (testing "tolerates a missing config"
+    (is (= {:root-dir "/tmp/notes"} (root-dir/with-root-dir nil "/tmp/notes")))
+    (is (= {} (root-dir/with-root-dir nil nil)))))
+
+(deftest write-cli-root-dir-creates-merges-and-removes
+  (let [base (node-helper/create-tmp-dir "cli-root-dir")
+        config-path (node-path/join base "nested" "cli.edn")
+        read-config #(reader/read-string (.toString (fs/readFileSync config-path)))]
+    (testing "creates the config, parent directory included"
+      (root-dir/write-cli-root-dir! config-path "/tmp/notes")
+      (is (= {:root-dir "/tmp/notes"} (read-config))))
+    (testing "merges into an existing config"
+      (fs/writeFileSync config-path (pr-str {:graph "demo" :root-dir "/tmp/old"}))
+      (root-dir/write-cli-root-dir! config-path "/tmp/notes")
+      (is (= {:graph "demo" :root-dir "/tmp/notes"} (read-config))))
+    (testing "clearing keeps the rest of the config"
+      (root-dir/write-cli-root-dir! config-path nil)
+      (is (= {:graph "demo"} (read-config))))
+    (testing "removes a config that would be left empty"
+      (fs/writeFileSync config-path (pr-str {:root-dir "/tmp/notes"}))
+      (root-dir/write-cli-root-dir! config-path nil)
+      (is (not (fs/existsSync config-path))))))
+
+(deftest write-cli-root-dir-leaves-unreadable-config-alone
+  (testing "a config that isn't an EDN map is never clobbered"
+    (let [base (node-helper/create-tmp-dir "cli-root-dir-invalid")
+          config-path (node-path/join base "cli.edn")]
+      (fs/writeFileSync config-path "[:not :a :map]")
+      (is (nil? (root-dir/write-cli-root-dir! config-path "/tmp/notes")))
+      (is (= "[:not :a :map]" (.toString (fs/readFileSync config-path)))))))

@@ -833,6 +833,52 @@
         (ipc/ipc :userAppCfgs :feature/enable-automatic-chmod? (not enabled?)))
      [:span.text-sm.opacity-50 (t :settings.advanced/auto-chmod-desc)])))
 
+(hsx/defc graphs-root-dir-row
+  [t]
+  (let [[info set-info!] (hooks/use-state nil)
+        {:keys [root-dir graphs-dir default? restart-required?]} info
+        load! (fn []
+                (-> (ipc/ipc :getGraphsRootDir)
+                    (p/then set-info!)))
+        apply! (fn [path]
+                 (-> (ipc/ipc :setGraphsRootDir path)
+                     (p/then (fn [info']
+                               (set-info! info')
+                               (when (js/confirm (t :ui/relaunch-confirm))
+                                 (js/logseq.api.relaunch))))
+                     (p/catch (fn [error]
+                                (notification/show!
+                                 (str (t :settings.advanced/graphs-root-dir-failed)
+                                      " " (or (ex-message error) error))
+                                 :error)))))]
+    ;; effects must not return the load promise
+    (hooks/use-effect! (fn [] (load!) js/undefined) [])
+    (row-with-button-action
+     {:left-label (t :settings.advanced/graphs-root-dir)
+      :description (t :settings.advanced/graphs-root-dir-desc)
+      :-for "graphs_root_dir"
+      :stretch true
+      :action
+      [:div.flex.flex-col.gap-2.w-full
+       [:code.text-xs.break-all.opacity-70 (or graphs-dir "")]
+       [:div.flex.gap-2
+        (shui/button
+         {:size :sm
+          :on-click (fn []
+                      (p/let [path (ipc/ipc :openDialog)]
+                        (when-not (or (string/blank? path) (= path root-dir))
+                          (apply! path))))}
+         (t :settings.advanced/graphs-root-dir-change))
+        (when (false? default?)
+          (shui/button
+           {:size :sm
+            :variant :ghost
+            :on-click #(apply! nil)}
+           (t :settings.advanced/graphs-root-dir-reset)))]
+       [:div.text-xs.opacity-50 (t :settings.advanced/graphs-root-dir-note)]
+       (when restart-required?
+         [:div.text-xs.text-warning (t :settings.advanced/graphs-root-dir-restart)])]})))
+
 (hsx/defc native-titlebar-row
   [t]
   (let [enabled? (state/use-sub [:electron/user-cfgs :window/native-titlebar?])]
@@ -905,6 +951,7 @@
      (sync-server-url-row)
      (publish-server-url-row)
      (when (util/electron?) (https-user-agent-row https-agent-opts))
+     (when (util/electron?) (graphs-root-dir-row t))
      (when (util/electron?) (auto-chmod-row t))
      ;; (clear-cache-row t)
 

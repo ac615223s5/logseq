@@ -10,6 +10,7 @@
             [electron.cli-install :as cli-install]
             [electron.configs :as cfgs]
             [electron.db :as db]
+            [electron.db-worker :as db-worker]
             [electron.embedding-server :as embedding-server]
             [electron.exceptions :as exceptions]
             [electron.handler :as handler]
@@ -384,6 +385,11 @@
   (.on app' "ready"
        (fn []
          (logger/info (str "Logseq App(" (.getVersion app') ") Starting... "))
+
+         ;; Must run before anything resolves a graph path, including the first window.
+         (let [root-dir (cfgs/apply-graphs-root-dir!)]
+           (db-worker/set-base-config! {:root-dir root-dir})
+           (logger/info ::graphs-root-dir {:path root-dir}))
 
          ;; Add React developer tool
          (when-let [^js devtoolsInstaller (and dev? (js/require "electron-devtools-installer"))]

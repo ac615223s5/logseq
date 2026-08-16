@@ -32,6 +32,7 @@
             [electron.window :as win]
             [electron.graph-switch-flow :as graph-switch-flow]
             [logseq.cli.common :as cli-common]
+            [logseq.cli.root-dir :as cli-root-dir]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-registry :as graph-registry]
@@ -349,6 +350,33 @@
                 nil)))
         (cfgs/get-item k))
       config)))
+
+(defn- graphs-root-dir-info
+  []
+  (let [root-dir (cfgs/resolved-graphs-root-dir)]
+    {:root-dir root-dir
+     :graphs-dir (cfgs/graphs-dir)
+     :default-root-dir (cfgs/default-graphs-root-dir)
+     :default? (nil? (cfgs/get-graphs-root-dir))
+     :restart-required? (not= root-dir (cfgs/active-graphs-root-dir))}))
+
+(defmethod handle :getGraphsRootDir [_window _]
+  (graphs-root-dir-info))
+
+(defmethod handle :setGraphsRootDir [_window [_ path]]
+  ;; A blank path restores the default location. Validate before persisting so a
+  ;; bad pick surfaces in the UI instead of bricking the next launch.
+  (try
+    (let [path (when-not (string/blank? path)
+                 (cli-root-dir/ensure-root-dir! path))
+          _ (cfgs/set-graphs-root-dir! path)
+          info (graphs-root-dir-info)]
+      (logger/info ::set-graphs-root-dir info)
+      info)
+    (catch :default e
+      (logger/error ::set-graphs-root-dir e)
+      (p/rejected (ex-info (or (ex-message e) "unable to use that directory")
+                           {:code :root-dir-permission :path path})))))
 
 (defmethod handle :getAppBaseInfo [^js win [_ _opts]]
   {:isFullScreen (.isFullScreen win)

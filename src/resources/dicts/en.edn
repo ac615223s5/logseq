@@ -1681,6 +1681,13 @@
  :settings.advanced/developer-mode-desc "Developer mode helps contributors and extension developers test their integrations with Logseq more efficiently."
  :settings.advanced/disable-sentry "Send usage data and diagnostics to Logseq"
  :settings.advanced/disable-sentry-desc "Logseq will never collect your local graph database or sell your data."
+ :settings.advanced/graphs-root-dir "Graph storage location"
+ :settings.advanced/graphs-root-dir-change "Change"
+ :settings.advanced/graphs-root-dir-desc "Where Logseq keeps your graph databases and assets."
+ :settings.advanced/graphs-root-dir-failed "Couldn't use that folder:"
+ :settings.advanced/graphs-root-dir-note "Existing graphs are not moved. Copy them into the new location before restarting, or Logseq will start with an empty graph list."
+ :settings.advanced/graphs-root-dir-reset "Use default"
+ :settings.advanced/graphs-root-dir-restart "Restart Logseq to start using this location."
  :settings.advanced/network-proxy "Network proxy"
 
  :settings.ai/enable-mcp-server "MCP Server"

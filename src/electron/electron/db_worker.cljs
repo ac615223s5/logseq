@@ -250,9 +250,22 @@
 
 (defonce ^:private *runtime-opts (atom {}))
 
+(defonce ^:private *base-config (atom {:owner-source :electron}))
+
+(defn set-base-config!
+  "Called once at startup. Every daemon call has to name the same root dir, or
+  start and stop would look for the lock in different places once the graph
+  storage location is customized."
+  [config]
+  (reset! *base-config (merge {:owner-source :electron} config)))
+
+(defn- base-config
+  []
+  @*base-config)
+
 (defn- start-managed-daemon!
   [repo]
-  (let [config (merge {:owner-source :electron}
+  (let [config (merge (base-config)
                       @*runtime-opts)]
     (p/let [_ (when (seq (:embedding-endpoint config))
                 (-> (cli-server/stop-server! config repo)
@@ -266,7 +279,7 @@
 
 (defn- stop-managed-daemon!
   [{:keys [repo]}]
-  (p/let [result (cli-server/stop-server! {:owner-source :electron} repo)]
+  (p/let [result (cli-server/stop-server! (base-config) repo)]
     (:ok? result)))
 
 (defonce manager
