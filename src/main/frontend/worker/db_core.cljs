@@ -1109,10 +1109,18 @@
   (when context (worker-state/update-context! context))
   nil)
 
+(defn- take-pending-editor-info!
+  "Move the editor info the client sent with a transaction into the undo stack's
+  pending slot. It rides along with the transaction instead of costing its own
+  round trip, and is stripped from tx-meta before transacting."
+  [repo tx-meta]
+  (worker-undo-redo/set-pending-editor-info! repo (:undo-redo/pending-editor-info tx-meta)))
+
 (def-thread-api :thread-api/transact
   [repo tx-data tx-meta context]
   (assert (some? repo))
   (worker-state/set-db-latest-tx-time! repo)
+  (take-pending-editor-info! repo tx-meta)
   (let [conn (worker-state/get-datascript-conn repo)]
     (assert (some? conn) {:repo repo})
     (try
@@ -1123,9 +1131,7 @@
                                 m)) tx-data)
                        tx-data)
             _ (when context (worker-state/set-context! context))
-            tx-meta' (cond-> tx-meta
-                       true
-                       (dissoc :insert-blocks?))]
+            tx-meta' (dissoc tx-meta :insert-blocks? :undo-redo/pending-editor-info)]
         (when-not (and (:create-today-journal? tx-meta)
                        (:today-journal-name tx-meta)
                        (seq tx-data')
@@ -1478,10 +1484,11 @@
 (def-thread-api :thread-api/apply-outliner-ops
   [repo ops opts]
   (when-let [conn (worker-state/get-datascript-conn repo)]
+    (take-pending-editor-info! repo opts)
     (try
       (worker-util/profile
        "apply outliner ops"
-       (outliner-op/apply-ops! conn ops opts))
+       (outliner-op/apply-ops! conn ops (dissoc opts :undo-redo/pending-editor-info)))
       (catch :default e
         (let [data (ex-data e)
               {:keys [type payload]} (when (map? data) data)]
