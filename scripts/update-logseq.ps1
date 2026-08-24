@@ -9,11 +9,11 @@
   Skips work if the release hasn't changed since the last run (unless -Force).
 
 .EXAMPLE
-  # One-liner (install or update):
+  # One-liner (install or update to the latest release):
   powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/update-logseq.ps1 | iex"
 
-  # From a saved copy:
-  powershell -ExecutionPolicy Bypass -File "$HOME\update-logseq.ps1" -Force
+  # Same, with options (no saved copy needed):
+  powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/update-logseq.ps1))) -Tag account-less-2.0.2 -Force"
 #>
 [CmdletBinding()]
 param(

@@ -128,7 +128,7 @@ powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.c
 curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | sudo bash
 ```
 
-More options:
+More options on Linux:
 
 ```bash
 # Install for the current user only (no root)
@@ -141,7 +141,15 @@ curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/in
 curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | sudo bash -s -- uninstall
 ```
 
-On Windows, save the script to pass options: `powershell -ExecutionPolicy Bypass -File update-logseq.ps1 -Tag account-less-2.0.2 -Force`.
+The same on Windows — options go after the script block, still one command:
+
+```powershell
+# Reinstall the latest release even if it looks up to date
+powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/update-logseq.ps1))) -Force"
+
+# Pin a specific release tag
+powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/update-logseq.ps1))) -Tag account-less-2.0.2"
+```
 
 ## 📚 Learn more
 
