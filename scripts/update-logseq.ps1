@@ -18,7 +18,7 @@
 [CmdletBinding()]
 param(
   [string]$Repo    = 'ac615223s5/logseq',
-  [string]$Tag     = '2.0.1',                 # release tag; 'latest' for the latest release
+  [string]$Tag     = 'latest',                # release tag, e.g. 'account-less-2.0.2'; 'latest' for the newest release
   [ValidateSet('', 'x64', 'arm64')]
   [string]$Arch    = '',                      # target arch; empty = detect this machine's
   [string]$Token   = $env:GITHUB_TOKEN,       # optional; only for a private repo

@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # Logseq Linux Installer Script
-# This script installs Logseq on Linux systems
+# This script installs or updates Logseq (this fork's account-less DB build) on Linux systems
 # Usage: ./install-linux.sh [version]
 
 set -e  # Exit on any error
 
 # Default values
 DEFAULT_VERSION="latest"
+DEFAULT_REPO="ac615223s5/logseq"
 INSTALL_DIR="/opt/logseq"
 BIN_DIR="/usr/local/bin"
 
@@ -36,31 +37,34 @@ Logseq Linux Installer
 
 This script installs Logseq on Linux systems.
 
+Re-running it over an existing installation updates it in place.
+
 USAGE:
     $0 [VERSION] [OPTIONS]
     $0 uninstall
 
 COMMANDS:
-    install (default)   Install Logseq
+    install (default)   Install or update Logseq
     uninstall           Removes Logseq installation (keeps user data)
 
 ARGUMENTS:
-    VERSION    Version to install (e.g., "0.10.14"). Default: latest
+    VERSION    Release tag to install (e.g., "account-less-2.0.2"). Default: latest
 
 OPTIONS:
     --help, -h          Show this help message
+    --repo OWNER/NAME   GitHub repo to install from (default: $DEFAULT_REPO)
     --prefix DIR        Installation prefix (default: /opt/logseq)
     --user              Install for current user only
     --no-desktop        Skip desktop integration
     --verbose, -v       Verbose output
 
 EXAMPLES:
-    $0                    # Install latest version
-    $0 0.10.14           # Install specific version
-    $0 --user            # Install for current user
+    $0                              # Install/update to the latest release
+    $0 account-less-2.0.2           # Install a specific release tag
+    $0 --user                       # Install for current user
     $0 --prefix ~/.local/share/logseq  # Custom install location
 
-For more information, visit: https://github.com/logseq/logseq
+For more information, visit: https://github.com/$DEFAULT_REPO
 HELP
 }
 
@@ -130,6 +134,7 @@ uninstall() {
 
 # Parse command line arguments
 VERSION="$DEFAULT_VERSION"
+REPO="$DEFAULT_REPO"
 USER_INSTALL=false
 SKIP_DESKTOP=false
 VERBOSE=false
@@ -139,6 +144,10 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             show_help
             exit 0
+            ;;
+        --repo)
+            REPO="$2"
+            shift 2
             ;;
         --prefix)
             INSTALL_DIR="$2"
@@ -204,19 +213,46 @@ fi
 cd "$TEMP_DIR"
 
 # Determine download URL
-if [[ "$VERSION" == "latest" ]]; then
-    log_info "Fetching latest release information..."
-    LATEST_RELEASE=$(curl -s https://api.github.com/repos/logseq/logseq/releases/latest)
-    DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep -o '"browser_download_url": "[^"]*Logseq-linux-x64-[^"]*\.zip"' | cut -d'"' -f4)
-    
-    if [[ -z "$DOWNLOAD_URL" ]]; then
-        log_error "Could not find download URL for latest version"
-        exit 1
+api_get() {
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' "$1"
+    else
+        curl -fsSL -H 'Accept: application/vnd.github+json' "$1"
     fi
+}
+
+if [[ "$VERSION" == "latest" ]]; then
+    log_info "Fetching latest release information from $REPO..."
+    # /releases/latest skips prereleases, and this fork marks some builds that
+    # way, so take the newest published release from the full list instead
+    RELEASE_JSON=$(api_get "https://api.github.com/repos/$REPO/releases?per_page=10" || true)
 else
-    DOWNLOAD_URL="https://github.com/logseq/logseq/releases/download/${VERSION}/Logseq-linux-x64-${VERSION}.zip"
+    log_info "Fetching release '$VERSION' from $REPO..."
+    RELEASE_JSON=$(api_get "https://api.github.com/repos/$REPO/releases/tags/$VERSION" || true)
 fi
 
+if [[ -z "$RELEASE_JSON" ]]; then
+    log_error "Could not read release information for '$VERSION' from $REPO"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Asset names differ across releases (Logseq-linux-x64-<v>.zip and
+# Logseq-linux-x86_64-<v>.zip have both been used); arm64 must not match here.
+DOWNLOAD_URL=$(printf '%s' "$RELEASE_JSON" \
+    | grep -o '"browser_download_url":[[:space:]]*"[^"]*"' \
+    | cut -d'"' -f4 \
+    | grep -E 'Logseq-linux-(x64|x86_64)-[^/]*\.zip$' \
+    | head -1 || true)
+
+if [[ -z "$DOWNLOAD_URL" ]]; then
+    log_error "No Linux x64 .zip asset found on release '$VERSION' in $REPO"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+RESOLVED_TAG=$(printf '%s' "$DOWNLOAD_URL" | awk -F/ '{print $(NF-1)}')
+log_info "Release: $RESOLVED_TAG"
 log_info "Download URL: $DOWNLOAD_URL"
 
 # Download Logseq
@@ -230,30 +266,42 @@ fi
 
 # Extract archive
 log_info "Extracting archive..."
-unzip -q logseq.zip
+unzip -q logseq.zip -d extracted
 
-# Find the extracted directory
-EXTRACTED_DIR=$(find . -maxdepth 2 -type d -name "Logseq-linux-x64*" | head -1)
+# Find the extracted app: releases are either flat (app at the archive root) or
+# wrapped in a single top-level directory
+EXTRACTED_DIR="$TEMP_DIR/extracted"
+if [[ ! -d "$EXTRACTED_DIR/resources" ]]; then
+    NESTED=$(find "$EXTRACTED_DIR" -maxdepth 2 -type d -name resources | head -1 || true)
+    if [[ -z "$NESTED" ]]; then
+        log_error "Could not find the Logseq app inside the archive"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+    EXTRACTED_DIR=$(dirname "$NESTED")
+fi
 
-if [[ -z "$EXTRACTED_DIR" ]]; then
-    log_error "Could not find extracted Logseq directory"
+# Current releases name the binary lowercase, older ones capitalised
+APP_BIN="logseq"
+if [[ ! -f "$EXTRACTED_DIR/logseq" ]]; then
+    APP_BIN="Logseq"
+fi
+if [[ ! -f "$EXTRACTED_DIR/$APP_BIN" ]]; then
+    log_error "Could not find the Logseq executable inside the archive"
     rm -rf "$TEMP_DIR"
     exit 1
 fi
 
-# Install files
+# Install files (copying over an existing install is how updates work)
 log_info "Installing files..."
-if [[ "$USER_INSTALL" == false ]]; then
-    mkdir -p "$INSTALL_DIR"
-    cp -r "$EXTRACTED_DIR"/* "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/Logseq"
-    ln -sf "$INSTALL_DIR/Logseq" "$BIN_DIR/logseq"
-else
-    mkdir -p "$INSTALL_DIR"
-    cp -r "$EXTRACTED_DIR"/* "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/Logseq"
-    ln -sf "$INSTALL_DIR/Logseq" "$BIN_DIR/logseq"
+mkdir -p "$INSTALL_DIR"
+cp -r "$EXTRACTED_DIR"/. "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/$APP_BIN"
+# Launchers and desktop entries from older installs point at the capitalised name
+if [[ "$APP_BIN" == "logseq" ]]; then
+    ln -sf "$INSTALL_DIR/logseq" "$INSTALL_DIR/Logseq"
 fi
+ln -sf "$INSTALL_DIR/$APP_BIN" "$BIN_DIR/logseq"
 
 # Fix sandbox permissions
 if [[ "$USER_INSTALL" == false && -f "$INSTALL_DIR/chrome-sandbox" ]]; then
@@ -288,7 +336,7 @@ if [[ "$SKIP_DESKTOP" == false ]]; then
 Version=1.0
 Name=Logseq
 Comment=Logseq - A privacy-first, open-source platform for knowledge management and collaboration
-Exec=$INSTALL_DIR/Logseq $([ "$USER_INSTALL" = true ] && echo "--no-sandbox") %U
+Exec=$INSTALL_DIR/$APP_BIN $([ "$USER_INSTALL" = true ] && echo "--no-sandbox") %U
 Icon=$ICON_DIR/logseq.png
 Terminal=false
 Type=Application
@@ -301,7 +349,9 @@ DESKTOP_EOF
     chmod +x "$DESKTOP_FILE"
     
     # 1. Find and copy the icon (try current paths first, then fallbacks)
-    if [[ -f "$INSTALL_DIR/resources/app/icons/logseq.png" ]]; then
+    if [[ -f "$INSTALL_DIR/resources/app.asar.unpacked/icons/logseq.png" ]]; then
+        cp "$INSTALL_DIR/resources/app.asar.unpacked/icons/logseq.png" "$ICON_DIR/logseq.png"
+    elif [[ -f "$INSTALL_DIR/resources/app/icons/logseq.png" ]]; then
         cp "$INSTALL_DIR/resources/app/icons/logseq.png" "$ICON_DIR/logseq.png"
     elif [[ -f "$INSTALL_DIR/resources/app.asar.unpacked/dist/icon.png" ]]; then
         cp "$INSTALL_DIR/resources/app.asar.unpacked/dist/icon.png" "$ICON_DIR/logseq.png"
@@ -327,14 +377,10 @@ rm -rf "$TEMP_DIR"
 
 # Verify installation
 if command -v logseq >/dev/null 2>&1; then
-    # Safely extract the version number from `package.json` as a priority, preventing the script from hanging during the launch of the Electron process.
-    if [[ -f "$INSTALL_DIR/resources/app/package.json" ]]; then
-        INSTALLED_VERSION=$(grep -m 1 '"version"' "$INSTALL_DIR/resources/app/package.json" | cut -d'"' -f4 || echo "unknown")
-    else
-        # Fallback Plan: Add a 2-second timeout to forcibly terminate the process, preventing the application from hanging.
-        INSTALLED_VERSION=$(timeout 2 logseq --version 2>/dev/null | head -1 || echo "unknown")
-    fi
-    
+    # Report the release we just installed; the app's own package.json lives inside
+    # app.asar, and launching the Electron binary to ask it would hang the script.
+    INSTALLED_VERSION="$RESOLVED_TAG"
+
     log_info "Logseq installed successfully!"
     log_info "Version: $INSTALLED_VERSION"
     log_info "Location: $INSTALL_DIR"

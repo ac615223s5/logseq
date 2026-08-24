@@ -57,6 +57,7 @@
   * [<g-emoji class="g-emoji" alias="database" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f680.png">🚀</g-emoji> Database Version](#-database-version)
   * [<g-emoji class="g-emoji" alias="thinking" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f914.png">🤔</g-emoji> Why Logseq?](#-why-logseq)
   * [<g-emoji class="g-emoji" alias="eyes" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f440.png">👀</g-emoji> How can I use it?](#-how-can-i-use-it)
+    * [⚡ One-line install / update](#-one-line-install--update)
   * [<g-emoji class="g-emoji" alias="books" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f4da.png">📚</g-emoji> Learn more](#-learn-more)
   * [🫶 Support Logseq Development](#-support-logseq-development)
   * [<g-emoji class="g-emoji" alias="bulb" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f4a1.png">💡</g-emoji> Feature requests](#-feature-requests)
@@ -108,18 +109,39 @@ To start using Logseq, follow these simple steps:
 
 That's it! You can now enjoy the benefits of using Logseq to streamline your workflow, manage your projects, and stay on top of your goals. Have fun! 🎉
 
-**Linux users**: Use the automated installer script for the best experience:
+### ⚡ One-line install / update
 
-   ```bash
-   # Download and run the installer
-   curl -fsSL https://raw.githubusercontent.com/logseq/logseq/master/scripts/install-linux.sh | bash
+This fork publishes its own desktop builds (account-less sync + E2EE). Each command below
+installs the [latest release](https://github.com/ac615223s5/logseq/releases/latest) if Logseq
+isn't there yet, and updates an existing install in place if it is — so re-run the same line to
+update.
 
-   # Or install a specific version
-   curl -fsSL https://raw.githubusercontent.com/logseq/logseq/master/scripts/install-linux.sh | bash -s -- 0.10.14
+**Windows** (PowerShell, per-user, no admin):
 
-   # For user-specific installation (no root required)
-   curl -fsSL https://raw.githubusercontent.com/logseq/logseq/master/scripts/install-linux.sh | bash -s -- --user
-   ```
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/update-logseq.ps1 | iex"
+```
+
+**Linux** (x64, system-wide):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | sudo bash
+```
+
+More options:
+
+```bash
+# Install for the current user only (no root)
+curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | bash -s -- --user
+
+# Pin a specific release tag
+curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | sudo bash -s -- account-less-2.0.2
+
+# Remove the installation (keeps your graphs)
+curl -fsSL https://raw.githubusercontent.com/ac615223s5/logseq/master/scripts/install-linux.sh | sudo bash -s -- uninstall
+```
+
+On Windows, save the script to pass options: `powershell -ExecutionPolicy Bypass -File update-logseq.ps1 -Tag account-less-2.0.2 -Force`.
 
 ## 📚 Learn more
 
