@@ -87,9 +87,10 @@ function Select-Asset([string]$suffixPattern) {
 # pick asset: ZIP for in-place update, NSIS installer for first install
 if ($installed) {
   $asset = Select-Asset '\.zip$'
-  # pre-2.0.1 releases used a single-arch name (Logseq-<ver>-win.zip), always x64
-  if (-not $asset -and $Arch -eq 'x64') {
+  # locally built releases use a single-arch name (Logseq-<ver>-win.zip), always x64
+  if (-not $asset) {
     $asset = $rel.assets | Where-Object { $_.name -match '-win\.zip$' } | Select-Object -First 1
+    if ($asset -and $Arch -eq 'arm64') { Info "no arm64 asset; using the x64 build (emulated)" }
   }
   if (-not $asset) { Fail "no Windows $Arch .zip asset on release '$($rel.tag_name)'" }
 } else {
