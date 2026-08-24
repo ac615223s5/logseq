@@ -150,7 +150,9 @@
    [:cycle-todos
     [:catn
      [:op :keyword]
-     [:args [:tuple ::block-ids [:enum :cycle :toggle-done]]]]]])
+     [:args [:or
+             [:tuple ::block-ids ::todo-transition]
+             [:tuple ::block-ids ::todo-transition ::steps]]]]]])
 
 (def ^:private ops-schema
   [:schema {:registry {::block map?
@@ -171,7 +173,9 @@
                        ::uuid uuid?
                        ::title string?
                        ::tx-data [:sequential :any]
-                       ::tx-meta [:maybe map?]}}
+                       ::tx-meta [:maybe map?]
+                       ::todo-transition [:enum :cycle :toggle-done]
+                       ::steps pos-int?}}
    [:sequential op-schema]])
 
 (def ^:private ops-validator (m/validator ops-schema))
@@ -208,30 +212,44 @@
                          {:outliner-op :toggle-reaction})
           true)))))
 
+(defn- next-todo-status
+  [transition status-ident]
+  (case transition
+    :toggle-done
+    (if (= :logseq.property/status.done status-ident)
+      :logseq.property/status.todo
+      :logseq.property/status.done)
+
+    :cycle
+    (case status-ident
+      :logseq.property/status.todo :logseq.property/status.doing
+      :logseq.property/status.doing :logseq.property/status.done
+      :logseq.property/status.done nil
+      :logseq.property/status.todo)))
+
 (defn- cycle-todos!
   "The next status is computed here rather than by callers so that rapid
   successive ops read the current worker db instead of the lagging
-  main-thread db, which would drop repeats."
-  [conn block-ids transition]
-  (doseq [block-id block-ids]
-    (when-let [block (d/entity @conn [:block/uuid block-id])]
-      (let [status-value (if (ldb/class-instance? (d/entity @conn :logseq.class/Task) block)
-                           (:logseq.property/status block)
-                           (get block :logseq.property/status {}))
-            next-status (case transition
-                          :toggle-done
-                          (if (= :logseq.property/status.done (:db/ident status-value))
-                            :logseq.property/status.todo
-                            :logseq.property/status.done)
-                          :cycle
-                          (case (:db/ident status-value)
-                            :logseq.property/status.todo :logseq.property/status.doing
-                            :logseq.property/status.doing :logseq.property/status.done
-                            :logseq.property/status.done nil
-                            :logseq.property/status.todo))]
-        (outliner-property/set-block-property!
-         conn [:block/uuid block-id] :logseq.property/status
-         (when next-status (:db/id (d/entity @conn next-status))))))))
+  main-thread db, which would drop repeats.
+
+  `steps` advances the transition that many times, so a burst of presses can
+  collapse into one transaction instead of one per press. Only the final status
+  is written; the intermediate ones are never observable anyway."
+  ([conn block-ids transition]
+   (cycle-todos! conn block-ids transition 1))
+  ([conn block-ids transition steps]
+   (doseq [block-id block-ids]
+     (when-let [block (d/entity @conn [:block/uuid block-id])]
+       (let [status-value (if (ldb/class-instance? (d/entity @conn :logseq.class/Task) block)
+                            (:logseq.property/status block)
+                            (get block :logseq.property/status {}))
+             next-status (reduce (fn [status-ident _]
+                                   (next-todo-status transition status-ident))
+                                 (:db/ident status-value)
+                                 (range (max 1 (or steps 1))))]
+         (outliner-property/set-block-property!
+          conn [:block/uuid block-id] :logseq.property/status
+          (when next-status (:db/id (d/entity @conn next-status)))))))))
 
 (defn- import-edn-data
   [conn *result export-map {:keys [tx-meta] :as import-options}]

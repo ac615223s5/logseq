@@ -71,6 +71,35 @@
       (cycle! :toggle-done)
       (is (= :logseq.property/status.done (status-ident))))))
 
+(deftest cycle-todos-op-steps
+  (testing "a coalesced burst lands on the same status as one op per press"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "Test"}
+                  :blocks [{:block/title "Task block"}]}])
+          block-uuid (:block/uuid (db-test/find-block-by-content @conn "Task block"))
+          status-ident (fn []
+                         (some-> (d/pull @conn [{:logseq.property/status [:db/ident]}]
+                                         [:block/uuid block-uuid])
+                                 :logseq.property/status :db/ident))
+          cycle! (fn [transition steps]
+                   (outliner-op/apply-ops! conn [[:cycle-todos [[block-uuid] transition steps]]] {}))]
+      (cycle! :cycle 2)
+      (is (= :logseq.property/status.doing (status-ident)))
+      (cycle! :cycle 1)
+      (is (= :logseq.property/status.done (status-ident)))
+      ;; 4 steps is a full cycle: doing -> ... -> doing
+      (cycle! :cycle 3)
+      (is (= :logseq.property/status.doing (status-ident)))
+      (cycle! :cycle 4)
+      (is (= :logseq.property/status.doing (status-ident)))
+      ;; toggle-done only alternates once it has reached done or todo
+      (cycle! :toggle-done 2)
+      (is (= :logseq.property/status.todo (status-ident)))
+      (cycle! :toggle-done 2)
+      (is (= :logseq.property/status.todo (status-ident)))
+      (cycle! :toggle-done 3)
+      (is (= :logseq.property/status.done (status-ident))))))
+
 (deftest apply-ops-plugin-property-sequence-test
   (testing "plugin property ops remain visible after a single apply-ops! batch"
     (let [conn (db-test/create-conn-with-blocks

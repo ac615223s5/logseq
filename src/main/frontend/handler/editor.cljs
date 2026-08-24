@@ -668,15 +668,54 @@
   []
   (distinct (seq (state/get-selection-blocks))))
 
+(defonce ^:private *todo-transitions
+  ;; Steps requested while a :cycle-todos transaction is in flight, keyed by
+  ;; [block-uuids transition]. Each transaction costs several worker round trips,
+  ;; so holding mod+enter used to queue one full pipeline per press.
+  (atom {:in-flight? false
+         :pending {}}))
+
+(declare flush-todo-transitions!)
+
+(defn- apply-todo-transitions!
+  [entries]
+  (let [result (ui-outliner-tx/transact!
+                {:outliner-op :cycle-todos}
+                (doseq [[[block-uuids transition] steps] entries]
+                  (outliner-op/cycle-todos! block-uuids transition steps)))]
+    (if (p/promise? result)
+      ;; catch before finally so a failed transaction still releases the queue
+      (-> result
+          (p/catch (fn [e] (log/error :cycle-todos-failed e)))
+          (p/finally flush-todo-transitions!))
+      (flush-todo-transitions!))))
+
+(defn- flush-todo-transitions!
+  [& _]
+  (let [{:keys [pending]} @*todo-transitions]
+    (if (seq pending)
+      (do
+        (swap! *todo-transitions assoc :pending {} :in-flight? true)
+        (apply-todo-transitions! pending))
+      (swap! *todo-transitions assoc :in-flight? false))))
+
 (defn transition-todos!
   "Advance the status of the given blocks. The next status is computed by the
   db worker so that rapid successive calls don't read a stale status from the
-  lagging main-thread db."
+  lagging main-thread db.
+
+  The first call transacts right away, so a single press stays instant. Calls
+  arriving while that transaction is in flight only accumulate a step count and
+  are applied as one transaction when it lands, so a burst of presses costs two
+  transactions instead of one per press."
   [block-uuids transition]
   (when (seq block-uuids)
-    (ui-outliner-tx/transact!
-     {:outliner-op :cycle-todos}
-     (outliner-op/cycle-todos! block-uuids transition))))
+    (let [k [(vec block-uuids) transition]]
+      (if (:in-flight? @*todo-transitions)
+        (swap! *todo-transitions update-in [:pending k] (fnil inc 0))
+        (do
+          (swap! *todo-transitions assoc :in-flight? true)
+          (apply-todo-transitions! {k 1}))))))
 
 (defn cycle-todos!
   []

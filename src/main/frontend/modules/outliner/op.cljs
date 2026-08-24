@@ -168,9 +168,11 @@
    [:toggle-reaction [target-uuid emoji-id user-uuid]]))
 
 (defn cycle-todos!
-  [block-eids transition]
-  (op-transact!
-   [:cycle-todos [(mapv ->block-id block-eids) transition]]))
+  ([block-eids transition]
+   (cycle-todos! block-eids transition 1))
+  ([block-eids transition steps]
+   (op-transact!
+    [:cycle-todos [(mapv ->block-id block-eids) transition steps]])))
 
 (defn batch-import-edn!
   [import-edn options]
