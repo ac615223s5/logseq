@@ -206,6 +206,7 @@ fi
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
 if [[ "$VERBOSE" == true ]]; then
     log_info "Using temporary directory: $TEMP_DIR"
 fi
@@ -292,23 +293,50 @@ if [[ ! -f "$EXTRACTED_DIR/$APP_BIN" ]]; then
     exit 1
 fi
 
-# Install files (copying over an existing install is how updates work)
+# Note whether the app is running before we replace the files it is executing
+APP_RUNNING=false
+if command -v pgrep >/dev/null 2>&1; then
+    # match on the executable path, so a copy running from somewhere else
+    # (another prefix, a dev build) doesn't trigger the warning
+    for pid in $({ pgrep -x logseq; pgrep -x Logseq; } 2>/dev/null); do
+        if [[ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" == "$INSTALL_DIR"/* ]]; then
+            APP_RUNNING=true
+            break
+        fi
+    done
+fi
+
+# Install files by staging a full copy next to the target and swapping it in.
+# Copying straight over an existing install fails with "Text file busy" when the
+# app is running, and a failure halfway through would leave a mix of two
+# versions behind; a directory rename is atomic and also drops stale files.
 log_info "Installing files..."
-mkdir -p "$INSTALL_DIR"
-cp -r "$EXTRACTED_DIR"/. "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/$APP_BIN"
+mkdir -p "$(dirname "$INSTALL_DIR")"
+STAGE_DIR="${INSTALL_DIR}.new-$$"
+OLD_DIR="${INSTALL_DIR}.old-$$"
+rm -rf "$STAGE_DIR" "$OLD_DIR"
+cp -a "$EXTRACTED_DIR" "$STAGE_DIR"
+chmod +x "$STAGE_DIR/$APP_BIN"
 # Launchers and desktop entries from older installs point at the capitalised name
 if [[ "$APP_BIN" == "logseq" ]]; then
-    ln -sf "$INSTALL_DIR/logseq" "$INSTALL_DIR/Logseq"
+    ln -sf "$INSTALL_DIR/logseq" "$STAGE_DIR/Logseq"
 fi
-ln -sf "$INSTALL_DIR/$APP_BIN" "$BIN_DIR/logseq"
 
-# Fix sandbox permissions
-if [[ "$USER_INSTALL" == false && -f "$INSTALL_DIR/chrome-sandbox" ]]; then
+# Sandbox permissions have to be set before the swap: the helper must be setuid
+# root or Electron refuses to start without --no-sandbox
+if [[ "$USER_INSTALL" == false && -f "$STAGE_DIR/chrome-sandbox" ]]; then
     log_info "Setting sandbox permissions..."
-    chown root:root "$INSTALL_DIR/chrome-sandbox"
-    chmod 4755 "$INSTALL_DIR/chrome-sandbox"
+    chown root:root "$STAGE_DIR/chrome-sandbox"
+    chmod 4755 "$STAGE_DIR/chrome-sandbox"
 fi
+
+if [[ -d "$INSTALL_DIR" ]]; then
+    mv "$INSTALL_DIR" "$OLD_DIR"
+fi
+mv "$STAGE_DIR" "$INSTALL_DIR"
+rm -rf "$OLD_DIR"
+
+ln -sf "$INSTALL_DIR/$APP_BIN" "$BIN_DIR/logseq"
 
 # Desktop integration
 if [[ "$SKIP_DESKTOP" == false ]]; then
@@ -385,6 +413,10 @@ if command -v logseq >/dev/null 2>&1; then
     log_info "Version: $INSTALLED_VERSION"
     log_info "Location: $INSTALL_DIR"
     log_info "Command: logseq"
+
+    if [[ "$APP_RUNNING" == true ]]; then
+        log_warn "Logseq was running during the update; restart it to load this version"
+    fi
     
     if [[ "$SKIP_DESKTOP" == false ]]; then
         log_info "Desktop integration: Enabled"
