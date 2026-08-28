@@ -35,7 +35,8 @@
       (aset arr i (.charCodeAt username i)))
     (.decode (new js/TextDecoder "utf-8") arr)))
 
-(defn parse-jwt [jwt]
+(defn- parse-jwt*
+  [jwt]
   (some-> jwt
           (string/split ".")
           second
@@ -43,6 +44,22 @@
           js/JSON.parse
           (js->clj :keywordize-keys true)
           (update :cognito:username decode-username)))
+
+(defonce ^:private *parsed-jwt
+  ;; Single-entry cache. `user-uuid` is called once per block on every block
+  ;; render, and each call otherwise base64-decodes the token and walks the
+  ;; whole payload through js->clj.
+  (atom {:jwt ::none :parsed nil}))
+
+(defn parse-jwt
+  "Parses a JWT payload, memoized on the token itself."
+  [jwt]
+  (let [{cached-jwt :jwt cached-parsed :parsed} @*parsed-jwt]
+    (if (= cached-jwt jwt)
+      cached-parsed
+      (let [parsed (parse-jwt* jwt)]
+        (reset! *parsed-jwt {:jwt jwt :parsed parsed})
+        parsed))))
 
 (defn- parse-jwt-safe
   [jwt]

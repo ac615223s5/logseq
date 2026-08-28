@@ -2258,8 +2258,10 @@
   (let [*bullet-dragging? (hooks/use-memo #(atom false) [])
         doc-mode? (state/use-sub :document/mode?)
         [control-show?] (hooks/use-atom *control-show?)
-        rtc-state (state/use-sub :rtc/state)
-        online-users (:online-users rtc-state)
+        ;; Subscribe to just the users, not the whole rtc atom: every local edit
+        ;; bumps counters like :unpushed-block-update-count in there, which would
+        ;; otherwise re-render every block's control on every keystroke.
+        online-users (state/use-sub :rtc/state :path-in-sub-atom [:online-users])
         current-user-uuid (user-handler/user-uuid)
         editing-user (editing-user-for-block uuid online-users current-user-uuid)
         ref? (:ref? config)

@@ -106,3 +106,27 @@
                 state/get-selection-block-ids (constantly nil)
                 state/get-selection-direction (constantly nil)]
     (is (nil? (state/get-editor-info)))))
+
+(deftest path-scoped-sub-ignores-unrelated-keys-test
+  (testing "a path-scoped subscription only notifies when its own path changes"
+    ;; `block-control` subscribes to :rtc/state via :path-in-sub-atom [:online-users].
+    ;; Every local edit bumps :unpushed-block-update-count in that same atom, so a
+    ;; whole-atom subscription re-renders every block control on every keystroke.
+    (let [rtc-state (atom {:online-users [{:user/name "a"}]
+                           :unpushed-block-update-count 0})
+          cursor (state/->PathCursor rtc-state [:online-users] nil)
+          fires (atom 0)]
+      (add-watch cursor ::test (fn [_ _ _ _] (swap! fires inc)))
+      (try
+        (swap! rtc-state assoc :unpushed-block-update-count 1)
+        (swap! rtc-state assoc :unpushed-block-update-count 2)
+        (is (= 0 @fires)
+            "sync counter churn must not notify an :online-users subscriber")
+        (is (= [{:user/name "a"}] @cursor)
+            "cursor still derefs to the scoped value")
+
+        (swap! rtc-state assoc :online-users [{:user/name "b"}])
+        (is (= 1 @fires)
+            "a real :online-users change must still notify")
+        (finally
+          (remove-watch cursor ::test))))))

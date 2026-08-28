@@ -14,6 +14,7 @@
             [frontend.ui :as ui]
             [frontend.util :as util]
             [frontend.util.ref :as ref]
+            [lambdaisland.glogi :as log]
             [logseq.common.util :as common-util]
             [logseq.common.util.page-ref :as page-ref]
             [logseq.db :as ldb]
@@ -568,7 +569,14 @@
     (hooks/use-effect!
      (fn []
        (let [q-str (get-q _block)
-             blocks-query? (:blocks? (query-dsl/parse-query q-str (db/get-db)))
+             ;; A malformed query (e.g. unbalanced parens) makes the reader throw.
+             ;; Thrown from an effect that tears down the whole block subtree, so
+             ;; stay lenient here like the `safe-read-string` above does.
+             blocks-query? (try
+                             (:blocks? (query-dsl/parse-query q-str (db/get-db)))
+                             (catch :default e
+                               (log/error :parse/query-failed e)
+                               nil))
              find-mode (cond
                          blocks-query?
                          :block

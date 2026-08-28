@@ -3529,11 +3529,13 @@
            (mldoc/block-with-title? first-elem-type))
          true)))
 
+(def ^:private db-collapsable-attributes
+  (set (remove #{:block/alias} db-property/db-attribute-properties)))
+
 (defn- db-collapsable?
   [block & {:keys [page-title?]}]
-  (let [class-properties (:classes-properties (outliner-property/get-block-classes-properties (db/get-db) (:db/id block)))
-        db (db/get-db)
-        attributes (set (remove #{:block/alias} db-property/db-attribute-properties))
+  (let [db (db/get-db)
+        class-properties (:classes-properties (outliner-property/get-block-classes-properties db (:db/id block)))
         bottom-positioned-property-idents (when-not page-title?
                                             (->> (outliner-property/get-block-positioned-properties db (:db/id block) :block-below)
                                                  (map :db/ident)
@@ -3541,7 +3543,7 @@
         properties (->> (:block.temp/property-keys block)
                         (map (partial entity-plus/entity-memoized db))
                         (concat class-properties)
-                        (remove (fn [e] (attributes (:db/ident e))))
+                        (remove (fn [e] (db-collapsable-attributes (:db/ident e))))
                         (remove (fn [property]
                                   (when-not page-title?
                                     (and (outliner-property/property-with-other-position? db block property)
@@ -3551,6 +3553,25 @@
     (or (seq properties)
         (ldb/class-instance? (entity-plus/entity-memoized db :logseq.class/Query) block))))
 
+(defn- collapsable?*
+  [block-id semantic? ignore-children? page-title? title-collapse-enabled?]
+  (if-let [block (db/entity [:block/uuid block-id])]
+    (or (if ignore-children? false (db-model/has-children? block-id))
+        (db-collapsable? block {:page-title? page-title?})
+        (and
+         title-collapse-enabled?
+         (block-with-title? (get block :block/format :markdown)
+                            (:block/title block)
+                            semantic?)))
+    false))
+
+(defonce ^:private *collapsable-cache
+  ;; `block-control` asks this for every block it renders, and answering means
+  ;; walking children, classes and positioned properties. The answer can only
+  ;; change when the db or the title-collapse setting changes, so memoize
+  ;; against those and drop the whole table when either moves on.
+  (volatile! {:db nil :title-collapse-enabled? ::none :vals {}}))
+
 (defn collapsable?
   ([block-id]
    (collapsable? block-id {}))
@@ -3558,15 +3579,20 @@
               :or {semantic? false
                    ignore-children? false}}]
    (when block-id
-     (if-let [block (db/entity [:block/uuid block-id])]
-       (or (if ignore-children? false (db-model/has-children? block-id))
-           (db-collapsable? block {:page-title? page-title?})
-           (and
-            (:outliner/block-title-collapse-enabled? (state/get-config))
-            (block-with-title? (get block :block/format :markdown)
-                               (:block/title block)
-                               semantic?)))
-       false))))
+     (let [db (db/get-db)
+           title-collapse-enabled? (:outliner/block-title-collapse-enabled? (state/get-config))
+           {cached-db :db cached-setting :title-collapse-enabled? cached-vals :vals} @*collapsable-cache
+           fresh? (and (identical? db cached-db) (= title-collapse-enabled? cached-setting))
+           vals (if fresh? cached-vals {})
+           k [block-id semantic? ignore-children? page-title?]
+           entry (find vals k)]
+       (if entry
+         (val entry)
+         (let [v (collapsable?* block-id semantic? ignore-children? page-title? title-collapse-enabled?)]
+           (vreset! *collapsable-cache {:db db
+                                        :title-collapse-enabled? title-collapse-enabled?
+                                        :vals (assoc vals k v)})
+           v))))))
 
 (defn <all-blocks-with-level
   "Return all blocks associated with correct level

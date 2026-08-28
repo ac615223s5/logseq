@@ -435,16 +435,32 @@
   ([] (get-graph-config (get-current-repo)))
   ([repo-url] (get-in @state [:config repo-url])))
 
+(defonce ^:private *merged-config
+  ;; Single-entry cache. `get-config` is reached from per-block render paths
+  ;; (e.g. `editor-handler/collapsable?`), and `merge-configs` otherwise
+  ;; re-merges `db-default-config` — nested `:default-queries` and all — on
+  ;; every call.
+  (atom nil))
+
 (defn get-config
   "User config for the given repo or current repo if none given. All config fetching
 should be done through this fn in order to get global config and config defaults"
   ([]
    (get-config (get-current-repo)))
   ([repo-url]
-   (merge-configs
-    db-default-config
-    (get-global-config)
-    (get-graph-config repo-url))))
+   (let [global (get-global-config)
+         graph (get-graph-config repo-url)
+         cached @*merged-config]
+     ;; The sources are persistent maps swapped into `state`, so identity is a
+     ;; sound cache key here: a miss only costs the merge we'd have done anyway.
+     (if (and (some? cached)
+              (= repo-url (:repo-url cached))
+              (identical? global (:global cached))
+              (identical? graph (:graph cached)))
+       (:config cached)
+       (let [config (merge-configs db-default-config global graph)]
+         (reset! *merged-config {:repo-url repo-url :global global :graph graph :config config})
+         config)))))
 
 (defn publishing-enable-editing?
   []
