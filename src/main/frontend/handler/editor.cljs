@@ -3568,11 +3568,13 @@
            (mldoc/block-with-title? first-elem-type))
          true)))
 
+(def ^:private db-collapsable-attributes
+  (set (remove #{:block/alias} db-property/db-attribute-properties)))
+
 (defn- db-collapsable?
   [block & {:keys [page-title?]}]
-  (let [class-properties (:classes-properties (outliner-property/get-block-classes-properties (db/get-db) (:db/id block)))
-        db (db/get-db)
-        attributes (set (remove #{:block/alias} db-property/db-attribute-properties))
+  (let [db (db/get-db)
+        class-properties (:classes-properties (outliner-property/get-block-classes-properties db (:db/id block)))
         bottom-positioned-property-idents (when-not page-title?
                                             (->> (outliner-property/get-block-positioned-properties db (:db/id block) :block-below)
                                                  (map :db/ident)
@@ -3580,7 +3582,7 @@
         properties (->> (:block.temp/property-keys block)
                         (map (partial entity-plus/entity-memoized db))
                         (concat class-properties)
-                        (remove (fn [e] (attributes (:db/ident e))))
+                        (remove (fn [e] (db-collapsable-attributes (:db/ident e))))
                         (remove (fn [property]
                                   (when-not page-title?
                                     (and (outliner-property/property-with-other-position? db block property)

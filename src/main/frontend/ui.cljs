@@ -731,12 +731,20 @@
        [:div.ml-4.text-lg
         content]])))
 
+(defn- error-fallback-element
+  "React renders a boundary's fallback directly, so hiccup has to be turned into
+  elements here. Returning raw hiccup makes React iterate the vector and choke on
+  its leading keyword (React error #31), which crashes the app instead of showing
+  the fallback. Already-built elements, strings and nil pass through untouched."
+  [error-view error]
+  (hsx/create-element
+   (if (fn? error-view) (error-view error) error-view)))
+
 (hsx/defc catch-error
   [error-view view]
   (error-boundary
    {:fallback (fn [^js props]
-                (let [error (.-error props)]
-                  (if (fn? error-view) (error-view error) error-view)))
+                (error-fallback-element error-view (.-error props)))
     :onError (fn [error _component-stack _event-id]
                (log/error :exception error))}
    view))
@@ -744,7 +752,8 @@
 (hsx/defc catch-error-and-notify
   [error-view view]
   (error-boundary
-   {:fallback (constantly error-view)
+   {:fallback (fn [^js props]
+                (error-fallback-element error-view (.-error props)))
     :onError (fn [error _component-stack _event-id]
                (log/error :exception error)
                (notification/show!
