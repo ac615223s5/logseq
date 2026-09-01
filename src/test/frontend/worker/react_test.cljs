@@ -117,3 +117,53 @@
                                         :logseq.property/deleted-at 1704196800000}])
           affected (worker-react/get-affected-queries-keys tx-report)]
       (is (some #{[:frontend.worker.react/journals]} affected)))))
+
+(deftest affected-keys-property-change-leaves-parent-alone
+  (testing "a property edit doesn't invalidate the parent, which would re-render the whole page"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "Test"}
+                  :blocks [{:block/title "Block"}]}])
+          block (db-test/find-block-by-content @conn "Block")
+          parent-id (:db/id (:block/parent block))
+          tx-report (d/transact! conn [{:db/id (:db/id block)
+                                        :block/updated-at 2}])
+          affected (worker-react/get-affected-queries-keys tx-report)]
+      (is (some #{[:frontend.worker.react/block (:db/id block)]} affected))
+      (is (not (some #{[:frontend.worker.react/block parent-id]} affected))))))
+
+(deftest affected-keys-structural-change-refreshes-parent
+  (testing "moving a block within its parent still refreshes the parent's children"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "Test"}
+                  :blocks [{:block/title "First"} {:block/title "Second"}]}])
+          first-block (db-test/find-block-by-content @conn "First")
+          second-block (db-test/find-block-by-content @conn "Second")
+          parent-id (:db/id (:block/parent first-block))
+          tx-report (d/transact! conn [{:db/id (:db/id first-block)
+                                        :block/order (db-order/gen-key (:block/order second-block) nil)}])
+          affected (worker-react/get-affected-queries-keys tx-report)]
+      (is (some #{[:frontend.worker.react/block parent-id]} affected)))))
+
+(deftest affected-keys-journals-untouched-by-edits-inside-a-journal
+  (testing "editing a block inside a journal doesn't refresh the journals list"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:build/journal 20240101}
+                  :blocks [{:block/title "Journal block"}]}])
+          block (db-test/find-block-by-content @conn "Journal block")
+          tx-report (d/transact! conn [{:db/id (:db/id block)
+                                        :block/updated-at 2}])
+          affected (worker-react/get-affected-queries-keys tx-report)]
+      (is (not (some #{[:frontend.worker.react/journals]} affected))))))
+
+(deftest affected-keys-journals-when-journal-created
+  (testing "a new journal page still refreshes the journals list"
+    (let [conn (db-test/create-conn-with-blocks [{:page {:build/journal 20240101}}])
+          tx-report (d/transact! conn [{:block/uuid (random-uuid)
+                                        :block/title "Jan 2nd, 2024"
+                                        :block/name "jan 2nd, 2024"
+                                        :block/journal-day 20240102
+                                        :block/created-at 1
+                                        :block/updated-at 1
+                                        :block/tags #{:logseq.class/Journal :logseq.class/Page}}])
+          affected (worker-react/get-affected-queries-keys tx-report)]
+      (is (some #{[:frontend.worker.react/journals]} affected)))))

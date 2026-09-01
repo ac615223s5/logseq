@@ -48,6 +48,16 @@
 (def ^:private order-list-affecting-attrs
   #{:block/parent :block/page :block/order :logseq.property/order-list-type})
 
+(def ^:private structure-affecting-attrs
+  "Attrs that change which children a parent renders. Only these need the
+  parent's block query refreshed; a property or title edit doesn't."
+  #{:block/parent :block/page :block/order})
+
+(def ^:private journals-list-affecting-attrs
+  "Attrs that can add, remove or reorder an entry in the journals list. Edits
+  *inside* a journal leave the list itself unchanged."
+  #{:block/tags :block/journal-day :block/uuid :logseq.property/deleted-at})
+
 (defn- block-attr?
   [attr]
   (= "block" (namespace attr)))
@@ -139,12 +149,13 @@
       (collect block))))
 
 (defn- affected-block-keys
-  [block]
+  [block structure-changed?]
   (let [page-id (or
                  (when (:block/name block) (:db/id block))
                  (:db/id (:block/page block)))
-        blocks [(when-let [parent-id (:db/id (:block/parent block))]
-                  [::block parent-id])
+        blocks [(when structure-changed?
+                  (when-let [parent-id (:db/id (:block/parent block))]
+                    [::block parent-id]))
                 [::block (:db/id block)]]
         refs (->> (keep (fn [ref]
                           (when-not (= (:db/id ref) page-id)
@@ -170,18 +181,12 @@
                   (map :v)
                   (distinct))
         journal-tag-id (:db/id (d/entity db-after :logseq.class/Journal))
-        touched-eids (->> tx-data (map :e) distinct)
-        journals? (or (some (fn [datom]
-                              (and (= :block/tags (:a datom))
-                                   (= journal-tag-id (:v datom))))
-                            tx-data)
-                      (some (fn [datom]
-                              (= :block/journal-day (:a datom)))
-                            tx-data)
-                      (some (fn [eid]
-                              (or (journal-page? db-before eid journal-tag-id)
-                                  (journal-page? db-after eid journal-tag-id)))
-                            touched-eids))
+        journals? (some (fn [datom]
+                          (and (contains? journals-list-affecting-attrs (:a datom))
+                               (or (= journal-tag-id (:v datom))
+                                   (journal-page? db-before (:e datom) journal-tag-id)
+                                   (journal-page? db-after (:e datom) journal-tag-id))))
+                        tx-data)
         reaction-targets (->> (filter (fn [datom]
                                         (= :logseq.property.reaction/target (:a datom))) tx-data)
                               (map :v)
@@ -189,12 +194,25 @@
         recycle-roots? (some (fn [datom]
                                (= :logseq.property/deleted-at (:a datom)))
                              tx-data)
+        ;; The pipeline stamps :block/tx-id on every touched block *and its
+        ;; page*, so an entity whose only datom is that stamp hasn't really
+        ;; changed. Treating it as changed refreshes the page entity on every
+        ;; edit inside it, which re-renders the whole page.
+        stamp-only-eids (->> (group-by :e tx-data)
+                             (keep (fn [[e datoms]]
+                                     (when (every? #(= :block/tx-id (:a %)) datoms) e)))
+                             set)
         other-blocks (->> (filter (fn [datom] (block-query-affecting-attr? (:a datom))) tx-data)
-                          (map :e))
+                          (map :e)
+                          (remove stamp-only-eids))
         order-list-affected-blocks (->> (filter (fn [datom]
                                                   (contains? order-list-affecting-attrs (:a datom))) tx-data)
                                         (map :e)
                                         (distinct))
+        structure-changed-eids (->> (filter (fn [datom]
+                                              (contains? structure-affecting-attrs (:a datom))) tx-data)
+                                    (map :e)
+                                    set)
         blocks (-> (concat blocks other-blocks) distinct)
         block-entities (keep (fn [block-id]
                                (let [block-id (if (and (string? block-id) (common-util/uuid-string? block-id))
@@ -203,7 +221,8 @@
                                  (d/entity db-after block-id))) blocks)
         affected-keys (concat
                        (mapcat
-                        affected-block-keys
+                        (fn [block]
+                          (affected-block-keys block (contains? structure-changed-eids (:db/id block))))
                         block-entities)
 
                        (mapcat
