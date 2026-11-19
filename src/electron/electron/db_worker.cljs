@@ -209,13 +209,19 @@
       (catch :default _
         nil))))
 
+;; How long a worker that accepts connections but does not answer /healthz is
+;; treated as busy before it is considered hung and replaced. Long requests block
+;; the worker's event loop (preparing a large graph upload took >10s), and
+;; replacing the worker kills the request it is serving.
+(def ^:private runtime-busy-budget-ms 30000)
+
 (defn- runtime-ready-default?
   [{:keys [storage repo generation] :as runtime}]
   (let [current (lifecycle/snapshot storage repo)]
     (if (and (= generation (.-generation current))
              (= "available" (.-phase current)))
       (if-let [lock (parse-runtime-lock runtime)]
-        (daemon/ready? lock)
+        (daemon/responsive? lock {:busy-budget-ms runtime-busy-budget-ms})
         (p/resolved false))
       (p/resolved false))))
 

@@ -77,3 +77,39 @@
                                               :timeout-ms 1000})]
         (= 200 status))
       (p/catch (fn [_] false))))
+
+(def ^:private busy-probe-max-timeout-ms 5000)
+
+(defn- probe-health
+  "One /healthz probe, classified. A worker whose event loop is blocked (e.g.
+  while it prepares a graph upload) still has its socket accepted by the kernel
+  but answers late, so a request timeout means :busy. A refused or reset
+  connection means :unreachable."
+  [{:keys [host port]} timeout-ms]
+  (-> (p/let [{:keys [status]} (http-request {:method "GET"
+                                              :host host
+                                              :port port
+                                              :path "/healthz"
+                                              :timeout-ms timeout-ms})]
+        (if (= 200 status) :ready :not-ready))
+      (p/catch (fn [error]
+                 (if (= :timeout (:code (ex-data error)))
+                   :busy
+                   :unreachable)))))
+
+(defn responsive?
+  "Like `ready?`, but keeps waiting while the worker is busy rather than dead.
+  Restarting a worker only because it answered /healthz late kills whatever
+  long-running request it is serving, such as a graph upload. Gives up and
+  returns false once a busy worker has not answered for `busy-budget-ms`."
+  [lock {:keys [busy-budget-ms]}]
+  (let [deadline (+ (js/Date.now) busy-budget-ms)]
+    (p/loop [timeout-ms 1000]
+      (p/let [result (probe-health lock timeout-ms)
+              remaining-ms (- deadline (js/Date.now))]
+        (case result
+          :ready true
+          :busy (if (pos? remaining-ms)
+                  (p/recur (min busy-probe-max-timeout-ms remaining-ms))
+                  false)
+          false)))))
