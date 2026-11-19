@@ -61,13 +61,6 @@
   [ws]
   (sync-transport/ws-open? ws))
 
-(defn- enqueue-asset-task!
-  [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
-
 (defn- enqueue-send-task!
   [client task]
   (if-let [queue (:send-queue client)]
@@ -225,6 +218,7 @@
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
+                            (contains? message :error-detail) (assoc :error-detail (:error-detail message))
                             (some? data) (assoc :data data))]
         (if (or (contains? message :success-tx-ids)
                 (contains? message :failed-tx-id))
@@ -249,7 +243,7 @@
     (request-pull! client local-tx))
   (sync-assets/enqueue-asset-sync!
    repo client
-   {:enqueue-asset-task-f enqueue-asset-task!
+   {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
     :current-client-f current-client
     :broadcast-rtc-state!-f broadcast-rtc-state!
     :fail-fast-f fail-fast})
@@ -283,9 +277,9 @@
         next-local-tx (max current-local-tx remote-tx)]
     (client-op/update-local-tx repo next-local-tx)
     (sync-util/clear-last-sync-error! client)
-    (broadcast-rtc-state! client)
     (sync-apply/mark-pending-txs-false! repo @(:inflight client))
     (reset! (:inflight client) [])
+    (broadcast-rtc-state! client)
     (verify-sync-checksum! repo client next-local-tx remote-tx remote-checksum {:type "tx/batch/ok"})
     (sync-apply/enqueue-flush-pending! repo client)))
 

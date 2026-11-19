@@ -4,6 +4,7 @@
             [frontend.fs :as fs]
             [frontend.state :as state]
             [frontend.util :as util]
+            [lambdaisland.glogi :as log]
             [logseq.common.config :as common-config]
             [logseq.common.path :as path]
             [logseq.common.util :as common-util]
@@ -19,7 +20,7 @@
 (defn alias-enabled?
   []
   (and (util/electron?)
-       (:assets/alias-enabled? @state/state)))
+       (:assets/alias-enabled? (state/get-state))))
 
 (defn clean-path-prefix
   [path]
@@ -35,7 +36,7 @@
 
 (defn get-alias-dirs
   []
-  (:assets/alias-dirs @state/state))
+  (:assets/alias-dirs (state/get-state)))
 
 (defn get-alias-by-dir
   [dir]
@@ -124,6 +125,37 @@
       (some-> (resolve-asset-real-path-url (state/get-current-repo) path)
               (common-util/safe-decode-uri-component)))))
 
+(defn- encode-iframe-path-segment
+  [segment]
+  (let [escaped (string/replace segment #"%(?![0-9a-fA-F]{2})" "%25")
+        decoded (try
+                  (js/decodeURIComponent escaped)
+                  ;; Invalid escapes represent literal filename characters.
+                  (catch :default _ segment))]
+    (js/encodeURIComponent decoded)))
+
+(defn local-file-iframe-src->assets-url
+  "Return an assets URL for a file or graph-relative asset `src`, or nil.
+
+  Preserve URL parameters and fragments, and encode filesystem path segments
+  once for the Electron assets protocol."
+  [src]
+  (when (string? src)
+    (when-let [url (try
+                     (cond
+                       (re-find #"(?i)^file:" src)
+                       (js/URL. src)
+
+                       (re-find #"^(?:\./|\.\./)*assets/" src)
+                       (when-let [repo-dir (some-> (state/get-current-repo) config/get-repo-dir)]
+                         (js/URL. (string/replace-first src #"^[./]+" "")
+                                  (str (path/prepend-protocol "file:" repo-dir) "/"))))
+                     (catch :default _ nil))]
+      (let [pathname (string/replace-first (.-pathname url)
+                                           #"^/([A-Za-z]):/" "/$1/logseq__colon/")
+            encoded-path (string/replace pathname #"[^/]+" encode-iframe-path-segment)]
+        (str "assets://" (.-host url) encoded-path (.-search url) (.-hash url))))))
+
 (defn <make-data-url
   [path]
   (let [repo-dir (config/get-repo-dir (state/get-current-repo))]
@@ -145,6 +177,108 @@
               css
               (map vector rel-paths blob-urls)))))
 
+(defn- decode-percent-encoded-file-path
+  "Decode one level of %XX escapes in each segment of a path string.
+
+  Markdown file links can keep %20 after the file:// scheme is stripped,
+  and a raw URL pathname keeps %20 after unwrap.  Those must become real
+  spaces before assets:// encoding, otherwise % is encoded again and the
+  URL contains %2520.
+
+  Decoding is per segment so an undecodable filename (e.g. `50%ba.png`,
+  where %ba is not valid UTF-8) is kept as literal characters without
+  blocking escapes elsewhere in the path."
+  [file-path]
+  (if (and (string? file-path)
+           (re-find #"(?i)%[0-9a-f]{2}" file-path))
+    (->> (string/split file-path #"/")
+         (map (fn [segment]
+                (let [escaped (string/replace segment #"%(?![0-9a-fA-F]{2})" "%25")]
+                  (try
+                    (.normalize (js/decodeURIComponent escaped) "NFC")
+                    ;; Invalid escapes are literal filename characters.
+                    (catch :default _ segment)))))
+         ;; string/join is deliberate: decoded segments are literal, so
+         ;; path-join's '..' / '.' resolution must not run on them.
+         #_{:clj-kondo/ignore [:path-invalid-construct/string-join]}
+         (string/join "/"))
+    file-path))
+
+(defn- file-url->encoded-path
+  "Extract the still percent-encoded pathname of a file:// or assets:// URL.
+
+  path/url-to-path is not used here because it decodes the URL before
+  reading the pathname: that collapses `%2520` (a literal `%20` in the
+  filename) into `%20` (a space).  Decoding the raw pathname once keeps
+  the two apart."
+  [file-url]
+  (if-let [^js url (try
+                     (js/URL. (string/replace file-url "assets://" "file://"))
+                     (catch :default e
+                       (log/error :assets/file-url-parse-failed {:file-url file-url :error e})
+                       nil))]
+    (let [path (.-pathname url)
+          host (.-host url)
+          path (if (string/starts-with? path "///")
+                 (subs path 2)
+                 path)
+          ;; assets:// URLs protect a Windows drive colon as
+          ;; /logseq__colon/ (see electron.utils/
+          ;; decode-protected-assets-schema-path); restore it before the
+          ;; drive-letter rule below so it resolves to a native C:/ path
+          path (string/replace path "/logseq__colon/" ":/")
+          ;; Win path fix: /C: or /C%3A (encoded drive colon) -> C:
+          path (if (re-find #"(?i)^/[a-zA-Z](?::|%3A)" path)
+                 (subs path 1)
+                 path)]
+      (if (string/blank? host)
+        path
+        (str "//" host path)))
+    file-url))
+
+(defn- local-file-path->absolute-path
+  "Resolve a filesystem path to an absolute native path.
+
+  `~` expands to the user home, `file://`/`assets://` URLs unwrap to their
+  raw URL pathname, absolute paths pass through, and `./`/`../`/bare
+  relative paths resolve against the graph dir.
+
+  Decoding applies only to the supplied path/URL portion: `%20` (or other
+  %XX) left by a stripped file:// link or carried in a URL pathname
+  becomes the real character, so later assets:// encoding produces %20
+  rather than %2520.  The repo/home prefixes are native paths and are not
+  decoded — a literal % in them must stay literal.  See
+  decode-percent-encoded-file-path for how literal % is preserved."
+  [file-path repo-dir]
+  (cond
+    (string/starts-with? file-path "~")
+    (path/path-join (get-in (state/get-state) [:system/info :home-dir])
+                    (decode-percent-encoded-file-path
+                     (string/replace-first file-path #"^~[/\\]*" "")))
+
+    (path/is-file-url? file-path)
+    (decode-percent-encoded-file-path (file-url->encoded-path file-path))
+
+    (path/absolute? file-path)
+    (decode-percent-encoded-file-path (path/file-url-or-path->path file-path))
+
+    :else
+    (path/path-join repo-dir (decode-percent-encoded-file-path file-path))))
+
+(defn file-path->assets-url
+  "Resolve a local filesystem path to an Electron assets:// URL.
+
+  `~/`, `file://`, absolute paths are used as-is; `./`/`../`/bare relative
+  paths resolve against the current graph dir.
+
+  Incoming %20 (or other %XX) in a native path is decoded before the URL is
+  encoded, so assets:// contains a single %20 rather than %2520."
+  [file-path]
+  (path/prepend-protocol "assets:"
+                         (protect-windows-drive-in-assets-path
+                          (local-file-path->absolute-path file-path
+                                                          (config/get-repo-dir (state/get-current-repo))))))
+
 (defn <make-asset-url
   "Make accessible asset url from path.
    If path is absolute url, return it directly.
@@ -159,26 +293,27 @@
      (let [repo (state/get-current-repo)
            repo-dir (config/get-repo-dir repo)
            local-asset? (common-config/local-relative-asset? path)
-           ;; Hack for path calculation
-           path (string/replace path #"^(\.\.)?/" "./")
+           ;; Hack for "../assets" path calculation
+           rpath (string/replace path #"^(\.\.)?/" "./")
            js-url? (not (nil? js-url))]
        (cond
          js-url?
          path                                               ;; just return the original
 
          (and (alias-enabled?)
-              (check-alias-path? path))
-         (resolve-asset-real-path-url (state/get-current-repo) path)
+              (check-alias-path? rpath))
+         (resolve-asset-real-path-url (state/get-current-repo) rpath)
 
           (util/electron?)
           (let [full-path (if local-asset?
-                            (path/path-join repo-dir path) path)]
+                            (path/path-join repo-dir rpath)
+                            (local-file-path->absolute-path path repo-dir))]
             ;; fullpath will be encoded
             (path/prepend-protocol "assets:" (protect-windows-drive-in-assets-path full-path)))
 
          :else
-         (p/let [binary (fs/read-file-raw repo-dir path {})
-                 svg? (string/ends-with? path ".svg")
+         (p/let [binary (fs/read-file-raw repo-dir rpath {})
+                 svg? (string/ends-with? rpath ".svg")
                  type (if svg? "image/svg+xml" "image")
                  blob (js/Blob. (array binary) (clj->js {:type type}))]
            (when blob (js/URL.createObjectURL blob))))))))
@@ -315,8 +450,7 @@
 
 (defn maybe-request-remote-asset-download!
   [repo asset-block file-ready?]
-  (let [progress-atom (get @state/state :rtc/asset-upload-download-progress)
-        progress (get (or (some-> progress-atom deref) {}) repo)]
+  (let [progress (get (or (state/get-state :rtc/asset-upload-download-progress) {}) repo)]
     (when (should-request-remote-asset-download? repo asset-block file-ready? progress)
       (state/<invoke-db-worker
        :thread-api/db-sync-request-asset-download

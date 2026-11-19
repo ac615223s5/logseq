@@ -8,13 +8,11 @@
             [clojure.set :as set]
             [clojure.string :as string]
             [electron.ipc :as ipc]
-            [frontend.common.missionary :as c.m]
             [frontend.common.sync-key :as sync-key]
             [frontend.common.thread-api :refer [def-thread-api]]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.debug :as debug]
-            [frontend.flows :as flows]
             [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -23,7 +21,6 @@
             [goog.crypt.Hmac]
             [goog.crypt.Sha256]
             [goog.crypt.base64 :as base64]
-            [missionary.core :as m]
             [promesa.core :as p]))
 
 ;;; userinfo, token, login/logout, ...
@@ -135,13 +132,13 @@
 
 (defn- auth-file-path
   []
-  (when-let [home-dir (get-in @state/state [:system/info :home-dir])]
+  (when-let [home-dir (state/get-state [:system/info :home-dir])]
     (path/path-join home-dir "logseq" "auth.json")))
 
 (defn- auth-file-payload
   []
   {:id-token (state/get-auth-id-token)
-   :access-token (:auth/access-token @state/state)
+   :access-token (state/get-state :auth/access-token)
    :refresh-token (state/get-auth-refresh-token)
    :updated-at (.now js/Date)})
 
@@ -199,20 +196,20 @@
 
 (defn- set-tokens!
   ([id-token access-token]
-   (state/set-auth-id-token id-token)
-   (state/set-auth-access-token access-token)
-   (set-token-to-localstorage! id-token access-token)
-   (persist-auth-file!)
-   (some->> (parse-jwt (state/get-auth-id-token))
-            (reset! flows/*current-login-user)))
+   (let [user (parse-jwt id-token)]
+     (state/set-auth-id-token id-token (:sub user))
+     (state/set-auth-access-token access-token)
+     (set-token-to-localstorage! id-token access-token)
+     (persist-auth-file!)
+     (state/set-state! :auth/current-login-user user)))
   ([id-token access-token refresh-token]
-   (state/set-auth-id-token id-token)
-   (state/set-auth-access-token access-token)
-   (state/set-auth-refresh-token refresh-token)
-   (set-token-to-localstorage! id-token access-token refresh-token)
-   (persist-auth-file!)
-   (some->> (parse-jwt (state/get-auth-id-token))
-            (reset! flows/*current-login-user))))
+   (let [user (parse-jwt id-token)]
+     (state/set-auth-id-token id-token (:sub user))
+     (state/set-auth-access-token access-token)
+     (state/set-auth-refresh-token refresh-token)
+     (set-token-to-localstorage! id-token access-token refresh-token)
+     (persist-auth-file!)
+     (state/set-state! :auth/current-login-user user))))
 
 (defn set-sync-key-tokens!
   "Enter sync-key mode: persist the passphrase and mint a self-signed token that
@@ -242,8 +239,13 @@
       (when-let [token (mint-sync-token)]
         (set-tokens! token token (stored-sync-key)))
     (when-let [refresh-token (state/get-auth-refresh-token)]
-      (let [resp (<! (<refresh-tokens refresh-token))]
+      (let [session (state/get-state :auth/graph-session)
+            resp (<! (<refresh-tokens refresh-token))]
         (cond
+          (or (not= refresh-token (state/get-auth-refresh-token))
+              (not= session (state/get-state :auth/graph-session)))
+          nil
+
           (and (<= 400 (:status resp))
                (> 500 (:status resp)))
           ;; invalid refresh-token
@@ -372,7 +374,7 @@
       (js/localStorage.setItem "sync-server-url" sync-server-url)))
   (state/clear-user-info!)
   (state/pub-event! [:user/logout])
-  (reset! flows/*current-login-user :logout))
+  (state/set-state! :auth/current-login-user :logout))
 
 (defn upgrade []
   (let [base-upgrade-url "https://logseqdemo.lemonsqueezy.com/checkout/buy/13e194b5-c927-41a8-af58-ed1a36d6000d"
@@ -396,20 +398,21 @@
                   (-> (state/get-auth-id-token) parse-jwt expired?))
           (ex-info "empty or expired token and refresh failed" {:anom :expired-token}))))))
 
-(def task--ensure-id&access-token
-  (m/sp
-    (let [id-token (state/get-auth-id-token)]
-      (when (or (nil? id-token)
-                (-> id-token parse-jwt almost-expired-or-expired?))
+(defn <ensure-id&access-token!
+  []
+  (let [id-token (state/get-auth-id-token)]
+    (if (or (nil? id-token)
+            (-> id-token parse-jwt almost-expired-or-expired?))
+      (p/let [_ (<refresh-id-token&access-token)]
         (prn (str "refresh tokens... " (tc/to-string (t/now))))
-        (c.m/<? (<refresh-id-token&access-token))
         (when (or (nil? (state/get-auth-id-token))
                   (-> (state/get-auth-id-token) parse-jwt expired?))
-          (throw (ex-info "empty or expired token and refresh failed" {:type :expired-token})))))))
+          (throw (ex-info "empty or expired token and refresh failed" {:type :expired-token}))))
+      (p/resolved nil))))
 
 (def-thread-api :thread-api/ensure-id&access-token
   []
-  (p/let [_ (js/Promise. task--ensure-id&access-token)]
+  (p/let [_ (<ensure-id&access-token!)]
     {:id-token (state/get-auth-id-token)}))
 
 ;;; user groups
@@ -420,6 +423,16 @@
             config/dev?
             (some? (config/get-custom-sync-server-url))
             (seq (set/intersection (state/user-groups) #{"team" "rtc_2025_07_10"})))))
+
+(defn can-list-remote-graphs?
+  "True when a logged-in user can fetch and display remote/synced graphs.
+
+  Official/default sync is available without saving Sync Server URL. Distinct
+  from `rtc-group?`, which still gates upload/RTC feature UI."
+  []
+  (boolean (and (logged-in?)
+                (or (config/get-custom-sync-server-url)
+                    config/default-db-sync-http-base))))
 
 (defn alpha-user?
   []
@@ -437,7 +450,7 @@
 
 (defn get-user-type
   [repo]
-  (-> (some #(when (= repo (:url %)) %) (:rtc/graphs @state/state))
+  (-> (some #(when (= repo (:url %)) %) (:rtc/graphs (state/get-state)))
       :graph<->user-user-type))
 
 (defn manager?
@@ -449,20 +462,18 @@
     [repo]
     (= (get-user-type repo) "member"))
 
-(defn new-task--upload-user-avatar
+(defn <upload-user-avatar
   [avatar-str]
-  (m/sp
-    (when-let [token (state/get-auth-id-token)]
-      (let [{:keys [status body] :as resp}
-            (c.m/<?
-             (http/post
-              (str "https://" config/API-DOMAIN "/logseq/get_presigned_user_avatar_put_url")
-              {:oauth-token token
-               :with-credentials? false}))]
-        (when-not (http/unexceptional-status? status)
-          (throw (ex-info "failed to get presigned url" {:resp resp})))
-        (let [presigned-url (:presigned-url body)
-              {:keys [status]} (c.m/<? (http/put presigned-url {:body avatar-str :with-credentials? false}))]
+  (when-let [token (state/get-auth-id-token)]
+    (p/let [{:keys [status body] :as resp}
+            (http/post
+             (str "https://" config/API-DOMAIN "/logseq/get_presigned_user_avatar_put_url")
+             {:oauth-token token
+              :with-credentials? false})]
+      (when-not (http/unexceptional-status? status)
+        (throw (ex-info "failed to get presigned url" {:resp resp})))
+      (let [presigned-url (:presigned-url body)]
+        (p/let [{:keys [status]} (http/put presigned-url {:body avatar-str :with-credentials? false})]
           (when-not (http/unexceptional-status? status)
             (throw (ex-info "failed to upload avatar" {:resp resp}))))))))
 

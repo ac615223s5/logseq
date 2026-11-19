@@ -11,19 +11,22 @@
             [electron.configs :as cfgs]
             [electron.db :as db]
             [electron.db-worker :as db-worker]
+            [electron.deeplink :as deeplink]
             [electron.embedding-server :as embedding-server]
             [electron.exceptions :as exceptions]
             [electron.handler :as handler]
             [electron.i18n :as i18n :refer [t]]
+            [electron.lifecycle :as lifecycle]
             [electron.logger :as logger]
             [electron.release-warning :as release-warning]
             [electron.server :as server]
             [electron.updater :refer [init-updater] :as updater]
-            [electron.url :refer [logseq-url-handler]]
+            [electron.url :as url]
             [electron.utils :refer [*win mac? dev? get-win-from-sender
                                     decode-protected-assets-schema-path send-to-renderer]
              :as utils]
             [electron.window :as win]
+            [lambdaisland.glogi :as log]
             [logseq.publishing.export :as publish-export]
             [promesa.core :as p]))
 
@@ -41,7 +44,9 @@
 
 (defonce *setup-fn (volatile! nil))
 (defonce *teardown-fn (volatile! nil))
+(defonce *lifecycle-op (volatile! (p/resolved nil)))
 (defonce *quit-dirty? (volatile! true))
+(defonce *pending-open-urls (atom []))
 
 (defn setup-updater! [^js win]
   ;; manual/auto updater
@@ -49,18 +54,10 @@
                  :win    win}))
 
 (defn open-url-handler
-  "win - the main window instance (first renderer process)
-   url - the input URL"
-  [win url]
-  (logger/info "open-url" {:url url})
-  ;; https://github.com/electron-userland/electron-builder/issues/1552
-  ;; At macOS platform this is captured at 'open-url' event, we set it with deeplinkingUrl = url! (See // Protocol handler for osx)
-  ;; At win32 platform this is saved at process.argv together with other arguments. To get only the provided url, deeplinkingUrl = argv.slice(1). (See // Protocol handler for win32)
-  (when-let [parsed-url (try (js/URL. url)
-                             (catch :default e
-                               (logger/info "upon opening non-url" {:error e})))]
-    (when (= (str LSP_SCHEME ":") (.-protocol parsed-url))
-      (logseq-url-handler win parsed-url))))
+  "Resolve and open a protocol URL in the appropriate window."
+  [window protocol-url]
+  (log/info :deeplink/open-url protocol-url)
+  (url/logseq-url-handler window (url/resolve-url protocol-url)))
 
 (defn- register-default-protocol-client!
   "Register Logseq as the default handler for the custom protocol.
@@ -81,8 +78,10 @@
    (fn [^js request callback]
      (let [url (.-url request)
            url (decode-protected-assets-schema-path url)
-           path (string/replace url "assets://" "")
-           path (js/decodeURIComponent path)]
+           ;; Query and fragment belong to the document URL, not the filename.
+           path (-> (first (string/split url #"[?#]" 2))
+                    (string/replace "assets://" "")
+                    (js/decodeURIComponent))]
        (cond (or (string/starts-with? path "/")
                  (re-find #"(?i)^/[a-zA-Z]:" path))
              (callback #js {:path path})
@@ -273,26 +272,39 @@
         menu (.buildFromTemplate Menu (clj->js template))]
     (.setApplicationMenu Menu menu)))
 
-(defn- find-deeplink-url
-  "Extract a deeplink URL from a sequence of command-line argument strings."
-  [args]
-  (some #(when (string/starts-with? % (str LSP_SCHEME ":")) %) args))
+(defn note-open-url!
+  "Handle a protocol URL immediately when a window exists; otherwise stash it
+   for cold-start handling. Returns `:handled`, `:pending`, or nil."
+  [url]
+  (cond
+    (not (string? url))
+    nil
+
+    @*win
+    (do (open-url-handler @*win url)
+        :handled)
+
+    :else
+    (do (swap! *pending-open-urls conj url)
+        (log/info :deeplink/pending-url url)
+        :pending)))
 
 (defn- setup-deeplink! []
-  ;; macOS: app fires open-url for custom-protocol links when the app is already running
+  ;; macOS emits open-url for custom-protocol links. On cold start this often
+  ;; fires before ready / before the main window exists — stash then.
   (.on app "open-url"
        (fn [^js event url]
          (.preventDefault event)
-         (when-let [win @*win]
-           (open-url-handler win url)))))
+         (note-open-url! url))))
 
-(defn- handle-initial-deeplink!
-  "On Windows/Linux, the protocol URL is passed as a command-line argument
-   on the first launch. Call this after the main window is ready."
-  [win]
-  (when-not mac?
-    (when-let [url (find-deeplink-url (rest (js->clj (.-argv js/process))))]
-      (open-url-handler win url))))
+(defn- handle-deferred-deeplink!
+  [window startup-target remaining-urls]
+  (when startup-target
+    (if (:graph-name startup-target)
+      (url/open-graph! window startup-target)
+      (url/logseq-url-handler window startup-target)))
+  (doseq [pending-url remaining-urls]
+    (open-url-handler window pending-url)))
 
 (defn- maybe-warn-wrong-release!
   []
@@ -366,6 +378,7 @@
                     (preferred-unix-cli-dir))]
     (cli-install/install-cli-launcher!
      {:windows? utils/win32?
+      :packaged? (.-isPackaged ^js app)
       :cli-path cli-path
       :cli-dir! cli-dir!
       :exe-path (.getPath app "exe")
@@ -388,7 +401,6 @@
 
          ;; Must run before anything resolves a graph path, including the first window.
          (let [root-dir (cfgs/apply-graphs-root-dir!)]
-           (db-worker/set-base-config! {:root-dir root-dir})
            (logger/info ::graphs-root-dir {:path root-dir}))
 
          ;; Add React developer tool
@@ -396,72 +408,84 @@
            (-> (.default devtoolsInstaller (.-REACT_DEVELOPER_TOOLS devtoolsInstaller))
                (.then #(js/console.log "Added Extension:" (.-REACT_DEVELOPER_TOOLS devtoolsInstaller)))))
 
-         (let [t0 (setup-interceptor! app')
-               ^js win (win/create-main-window!)
-               _ (reset! *win win)]
+         (-> (db-worker/<prepare-startup!)
+             (p/then
+              (fn [_]
+                (let [t0 (setup-interceptor! app')
+                      [startup-url & remaining-urls] (deeplink/startup-deeplink-urls
+                                                      @*pending-open-urls (js->clj (.-argv js/process)) mac?)
+                      startup-target (when startup-url (url/resolve-url startup-url))
+                      startup-graph (:graph-name startup-target)
+                      ^js win (win/create-main-window!
+                               win/MAIN_WINDOW_ENTRY
+                               (when startup-graph {:graph startup-graph}))
+                      _ (reset! *win win)]
+                  (reset! *pending-open-urls [])
 
-           (utils/<restore-proxy-settings)
+                  (utils/<restore-proxy-settings)
 
-           (js-utils/disableXFrameOptions win)
+                  (js-utils/disableXFrameOptions win)
 
-           (db/ensure-graphs-dir!)
-           (install-cli-launcher!)
+                  (db/ensure-graphs-dir!)
+                  (install-cli-launcher!)
 
-           ;; Windows/Linux: handle deeplink URL passed on first launch via argv
-           (handle-initial-deeplink! win)
-           (maybe-warn-wrong-release!)
+                  (handle-deferred-deeplink! win startup-target remaining-urls)
+                  (maybe-warn-wrong-release!)
 
-           (vreset! *setup-fn
-                    (fn []
-                      (let [t1 (setup-updater! win)
-                            t2 (setup-app-manager! win)
-                            t3 (handler/set-ipc-handler! win)
-                            t4 (server/setup! win)
-                            t5 (when (cfgs/semantic-search-enabled?)
-                                 (embedding-server/setup! app'))
-                            tt (exceptions/setup-exception-listeners!)]
+                  (vreset! *setup-fn
+                           (fn []
+                             (let [t1 (setup-updater! win)
+                                   t2 (setup-app-manager! win)
+                                   t3 (handler/set-ipc-handler! win)
+                                   t4 (server/setup! win)
+                                   t5 (when (cfgs/semantic-search-enabled?)
+                                        (embedding-server/setup! app'))
+                                   tt (exceptions/setup-exception-listeners!)]
 
-                        (vreset! *teardown-fn
-                                 #(-> (handler/stop-all-db-workers!)
-                                      (p/finally
-                                        (fn []
-                                          (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                            (and f (f))))))))))
+                               (vreset! *teardown-fn
+                                        #(-> (handler/stop-all-db-workers!)
+                                             (p/finally
+                                               (fn []
+                                                 (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                   (and f (f))))))))))
 
-           ;; setup effects
-           (@*setup-fn)
+                  ;; setup effects
+                  (@*setup-fn)
 
-           ;; main window events
-           (.on win "close" (fn [e]
-                              (when @*quit-dirty? ;; when not updating
-                                (.preventDefault e)
+                  ;; main window events
+                  (.on win "close" (fn [e]
+                                     (when @*quit-dirty? ;; when not updating
+                                       (.preventDefault e)
 
-                                (let [windows (win/get-all-windows)
-                                      window @*win
-                                      multiple-windows? (> (count windows) 1)]
-                                  (cond
-                                    (or multiple-windows? (not mac?) @win/*quitting?)
-                                    (when window
-                                      (win/close-handler win e)
-                                      (reset! *win nil))
+                                       (let [windows (win/get-all-windows)
+                                             window @*win
+                                             multiple-windows? (> (count windows) 1)]
+                                         (cond
+                                           (or multiple-windows? (not mac?) @win/*quitting?)
+                                           (when window
+                                             (win/close-handler win e)
+                                             (reset! *win nil))
 
-                                    (and mac? (not multiple-windows?))
-                                        ;; Just hiding - don't do any actual closing operation
-                                    (do (.preventDefault ^js/Event e)
-                                        (if (and mac? (.isFullScreen win))
-                                          (do (.once win "leave-full-screen" #(.hide win))
-                                              (.setFullScreen win false))
-                                          (.hide win)))
-                                    :else
-                                    nil)))))
-           (.on app' "before-quit" (fn [_e]
-                                     (reset! win/*quitting? true)
-                                     (-> (handler/stop-all-db-workers!)
-                                         (p/finally
-                                           (fn []
-                                             (embedding-server/stop!))))))
+                                           (and mac? (not multiple-windows?))
+                                               ;; Just hiding - don't do any actual closing operation
+                                           (do (.preventDefault ^js/Event e)
+                                               (if (and mac? (.isFullScreen win))
+                                                 (do (.once win "leave-full-screen" #(.hide win))
+                                                     (.setFullScreen win false))
+                                                 (.hide win)))
+                                           :else
+                                           nil)))))
+                  (.on app' "before-quit" (fn [_e]
+                                            (reset! win/*quitting? true)
+                                            (-> (handler/stop-all-db-workers!)
+                                                (p/finally
+                                                  (fn []
+                                                    (embedding-server/stop!))))))
 
-           (.on app' "activate" #(when @*win (.show win)))))))
+                  (.on app' "activate" #(when @*win (.show win))))))
+             (p/catch (fn [error]
+                        (logger/error :electron/worker-upgrade-failed error)
+                        (.quit app')))))))
 
 (defn main []
   (if-not (.requestSingleInstanceLock app)
@@ -474,8 +498,13 @@
       (.registerSchemesAsPrivileged
        protocol (bean/->js [{:scheme     LSP_SCHEME
                              :privileges privileges}
+                            ;; the app page and its scripts load from lsp://;
+                            ;; Chromium keeps compiled script code across runs
+                            ;; only for schemes registered with :codeCache, so
+                            ;; without it the 16 MB main.js was compiled anew
+                            ;; at every app open
                             {:scheme     FILE_LSP_SCHEME
-                             :privileges privileges}
+                             :privileges (assoc privileges :codeCache true)}
                             {:scheme     FILE_ASSETS_SCHEME
                              :privileges (assoc privileges :stream true)}]))
 
@@ -487,10 +516,9 @@
       (.on app "second-instance"
            (fn [_event ^js command-line _working-directory]
              (when-let [window @*win]
-               (win/switch-to-window! window)
-               ;; Windows/Linux: deeplink URL may appear in subsequent-instance commandLine
-               (when-let [url (find-deeplink-url (rest (js->clj command-line)))]
-                 (open-url-handler window url)))))
+               (win/switch-to-window! window))
+             (when-let [url (deeplink/find-deeplink-url (rest (js->clj command-line)))]
+               (note-open-url! url))))
 
       (.on app "window-all-closed" (fn []
                                      (logger/debug "window-all-closed" "Quitting...")
@@ -501,10 +529,30 @@
                                              (.quit app))))))
       (on-app-ready! app))))
 
+(defn- <run-current-teardown!
+  []
+  (if-let [teardown! @*teardown-fn]
+    (do
+      (vreset! *teardown-fn nil)
+      (try
+        (-> (or (teardown!) (p/resolved nil))
+            (p/catch (fn [e]
+                       (logger/warn :electron/teardown-failed e)
+                       nil)))
+        (catch :default e
+          (logger/warn :electron/teardown-failed e)
+          (p/resolved nil))))
+    (p/resolved nil)))
+
 (defn start []
   (logger/debug "Main - start")
-  (when @*setup-fn (@*setup-fn)))
+  (lifecycle/enqueue!
+   *lifecycle-op
+   #(-> (<run-current-teardown!)
+        (p/then (fn [_]
+                  (when-let [setup! @*setup-fn]
+                    (setup!)))))))
 
 (defn stop []
   (logger/debug "Main - stop")
-  (when @*teardown-fn (@*teardown-fn)))
+  (lifecycle/enqueue! *lifecycle-op <run-current-teardown!))

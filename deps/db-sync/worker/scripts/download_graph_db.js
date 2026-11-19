@@ -103,6 +103,23 @@ async function fetchSnapshotDescriptor(options) {
   return fetchJson(url, options.adminToken);
 }
 
+function snapshotRequestUrl(baseUrl, graphId, serverUrl) {
+  const base = normalizeBaseUrl(baseUrl);
+  const streamPath = `/sync/${graphId}/snapshot/stream`;
+  let parsed;
+  try {
+    parsed = new URL(serverUrl);
+  } catch {
+    return `${base}${streamPath}`;
+  }
+  // The node adapter may return an internal or http origin. The bytes live on
+  // the same API the caller already used for the descriptor.
+  if (parsed.pathname === streamPath) {
+    return `${base}${streamPath}${parsed.search}`;
+  }
+  return serverUrl;
+}
+
 async function fetchSnapshotBytes(url, adminToken) {
   const response = await fetch(url, {
     method: "GET",
@@ -114,21 +131,18 @@ async function fetchSnapshotBytes(url, adminToken) {
     throw new Error(`Snapshot download failed (${response.status}) for ${url}: ${body}`);
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const contentEncoding = response.headers.get("content-encoding");
-
-  return {
-    buffer,
-    contentEncoding,
-  };
+  return Buffer.from(await response.arrayBuffer());
 }
 
 function hasGzipMagic(buffer) {
   return buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
 }
 
-function maybeDecompressBuffer(buffer, contentEncoding) {
-  if (contentEncoding === "gzip" && hasGzipMagic(buffer)) {
+function maybeDecompressBuffer(buffer) {
+  // Never trust content-encoding alone: snapshot URLs (e.g. R2 presigned
+  // URLs) may serve gzip bytes without a content-encoding header/descriptor.
+  // Sniff gzip magic bytes, matching src/main/frontend/worker/sync/download.cljs.
+  if (hasGzipMagic(buffer)) {
     return zlib.gunzipSync(buffer);
   }
 
@@ -214,9 +228,11 @@ async function main() {
     fail("Snapshot download response missing URL.");
   }
 
-  const snapshot = await fetchSnapshotBytes(descriptor.url, options.adminToken);
-  const effectiveEncoding = descriptor["content-encoding"] || snapshot.contentEncoding || "";
-  const decompressed = maybeDecompressBuffer(snapshot.buffer, effectiveEncoding);
+  const buffer = await fetchSnapshotBytes(
+    snapshotRequestUrl(options.baseUrl, options.graphId, descriptor.url),
+    options.adminToken,
+  );
+  const decompressed = maybeDecompressBuffer(buffer);
   const rows = parseFramedRows(decompressed);
 
   writeSnapshotSqlite({
@@ -242,5 +258,6 @@ module.exports = {
   parseCliArgs,
   parseFramedRows,
   sanitizeGraphIdForFilename,
+  snapshotRequestUrl,
   writeSnapshotSqlite,
 };

@@ -8,8 +8,9 @@ type block_opts = {
   target_page : string option;
   pos : Block.position option;
   content : string option;
-  blocks_edn : string option;
+  blocks_markdown : string option;
   blocks_file : Cli_primitive.path option;
+  dry_run : bool;
   update_tags_edn : string option;
   update_properties_edn : string option;
   remove_tags_edn : string option;
@@ -19,6 +20,7 @@ type block_opts = {
 type page_opts = {
   id : Cli_primitive.db_id option;
   page : string option;
+  rename : string option;
   restore : bool;
   update_tags_edn : string option;
   update_properties_edn : string option;
@@ -98,7 +100,9 @@ type block_create = {
   tags : Selector.tag Rrbvec.t;
   properties : Property.assignment Rrbvec.t;
   blocks : Block.t Rrbvec.t;
+  markdown_blocks : bool;
   update_plan : Property.update_plan;
+  dry_run : bool;
 }
 
 type block_update = {
@@ -128,6 +132,7 @@ type action =
       mode : mode;
       id : Cli_primitive.db_id option;
       page : string option;
+      rename : string option;
       restore : bool;
       plan : Property.update_plan;
     }
@@ -249,13 +254,14 @@ let update_opts_of_block_opts (opts : block_opts) : Update.opts =
     update_properties_edn = opts.update_properties_edn;
     remove_tags_edn = opts.remove_tags_edn;
     remove_properties_edn = opts.remove_properties_edn;
-    blocks_edn = opts.blocks_edn;
+    blocks_markdown = opts.blocks_markdown;
     blocks_file = opts.blocks_file;
   }
 
 let invalid_options = function
   | Parsed_block opts when update_mode opts ->
-      Update.invalid_options (update_opts_of_block_opts opts)
+      if opts.dry_run then Some "--dry-run is only for create mode"
+      else Update.invalid_options (update_opts_of_block_opts opts)
   | Parsed_block opts
     when (not (update_mode opts))
          && (Option.is_some opts.remove_tags_edn
@@ -271,6 +277,10 @@ let invalid_options = function
       Some "only one of --id or --page is allowed"
   | Parsed_page { page = Some page; _ } when String.trim page = "" ->
       Some "page must be non-empty"
+  | Parsed_page { rename = Some rename; _ } when String.trim rename = "" ->
+      Some "rename must be non-empty"
+  | Parsed_page { id = None; page = None; rename = Some _; _ } ->
+      Some "--rename requires --id or --page"
   | Parsed_tag { name = Some name; _ } when normalize_tag_name name = None ->
       Some "tag name must not be blank"
   | Parsed_property opts
@@ -460,9 +470,10 @@ let add_action_of_block_create (action : block_create) : Add.action =
     tags = action.tags;
     properties = action.properties;
     blocks = action.blocks;
+    markdown_blocks = action.markdown_blocks;
   }
 
-let block_create_of_add_action ~update_plan (action : Add.action) =
+let block_create_of_add_action ~update_plan ~dry_run (action : Add.action) =
   Error.map
     (fun target ->
       {
@@ -474,7 +485,9 @@ let block_create_of_add_action ~update_plan (action : Add.action) =
         tags = action.tags;
         properties = action.properties;
         blocks = action.blocks;
+        markdown_blocks = action.Add.markdown_blocks;
         update_plan;
+        dry_run;
       })
     (block_target_of_parts action.target_id action.target_uuid
        action.target_page_name)
@@ -708,6 +721,7 @@ let build_page repo graph (opts : page_opts) =
                  mode = Update;
                  id = Some id;
                  page;
+                 rename = opts.rename;
                  restore = opts.restore;
                  plan;
                })
@@ -717,9 +731,10 @@ let build_page repo graph (opts : page_opts) =
                {
                  repo;
                  graph;
-                 mode = Create;
+                 mode = (if Option.is_some opts.rename then Update else Create);
                  id = None;
                  page = Some page;
+                 rename = opts.rename;
                  restore = opts.restore;
                  plan;
                })
@@ -813,7 +828,7 @@ let build_asset repo graph (opts : asset_opts) =
           tags_edn = None;
           properties_edn = None;
           content = Some title;
-          blocks_edn = None;
+          blocks_markdown = None;
           blocks_file = None;
         }
       in
@@ -833,7 +848,7 @@ let build_asset repo graph (opts : asset_opts) =
                   create_action = Some create_action;
                 })
             (block_create_of_add_action ~update_plan:Property.empty_update_plan
-               create_action))
+               ~dry_run:false create_action))
   | None, None, None ->
       Error
         (Error.make Error.Missing_asset_selector
@@ -1060,7 +1075,7 @@ let build_block repo (opts : block_opts) =
             tags_edn = None;
             properties_edn = None;
             content = opts.content;
-            blocks_edn = opts.blocks_edn;
+            blocks_markdown = opts.blocks_markdown;
             blocks_file = opts.blocks_file;
           }
         in
@@ -1068,7 +1083,8 @@ let build_block repo (opts : block_opts) =
           (fun action ->
             Error.map
               (fun action -> Upsert_block (Block_create action))
-              (block_create_of_add_action ~update_plan:plan action)))
+              (block_create_of_add_action ~update_plan:plan
+                 ~dry_run:opts.dry_run action)))
 
 let build ?registry:_ config _globals parsed =
   Error.bind (validate_parsed parsed) (fun () ->
@@ -1124,6 +1140,7 @@ let property_selector =
          kw "block/uuid";
          kw "block/name";
          kw "block/title";
+         kw "db/valueType";
          kw "logseq.property/type";
        |])
 
@@ -1328,7 +1345,10 @@ let first_entity value =
       Some (Vec.peek_front values)
   | _, Some values when not (Vec.is_empty values) ->
       Some (Vec.peek_front values)
-  | _ -> None
+  | _ -> (
+      match Edn_util.as_map value with
+      | Some _ -> Some value
+      | None -> None)
 
 let id_of_entity value = Edn_util.get_int64 value "db/id"
 
@@ -1378,7 +1398,10 @@ let lookup_of_tag = function
 let apply_outliner_ops config repo ops =
   Transport.thread_api_apply_outliner_ops config ~repo
     ~ops:(Edn_util.vector_t_vec ops)
-    ~options:(Edn_util.map_t_vec Vec.empty)
+    ~options:(Edn_util.map_t_vec
+      (if Vec.length ops > 1 then
+         Vec.singleton (kw "outliner-op", kw "apply-outliner-ops")
+       else Vec.empty))
 
 let create_tag_page config repo name =
   let op =
@@ -1410,17 +1433,17 @@ let create_page config repo name =
   in
   apply_outliner_ops config repo (Vec.singleton op)
 
+let rename_page_op uuid name =
+  vector_vec
+    (Vec.of_array
+       [|
+         kw "rename-page";
+         vector_vec
+           (Vec.of_array [| Edn_util.uuid uuid; Edn_util.string name |]);
+       |])
+
 let rename_page config repo uuid name =
-  let op =
-    Edn_util.vector_vec
-      (Vec.of_array
-         [|
-           kw "rename-page";
-           Edn_util.vector_vec
-             (Vec.of_array [| Edn_util.uuid uuid; Edn_util.string name |]);
-         |])
-  in
-  apply_outliner_ops config repo (Vec.singleton op)
+  apply_outliner_ops config repo (Vec.singleton (rename_page_op uuid name))
 
 let value_of_kind kind = Edn_util.keyword (Property.string_of_kind kind)
 
@@ -1568,10 +1591,6 @@ let property_key_label = function
   | Key_id id -> Int64.to_string id
   | Key_name name -> name
 
-let string_starts_with ~prefix value =
-  let prefix_len = String.length prefix in
-  String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
-
 let qualified_property_ident ident =
   String.contains (property_key_label (Property.Key_ident ident)) '/'
 
@@ -1596,6 +1615,14 @@ let resolved_schema_property_ident key entity =
 let resolved_schema_property_ident_from_query key result =
   match first_entity result with
   | Some entity -> resolved_schema_property_ident key entity
+  | None -> Error (property_not_found_error key)
+
+let resolved_property_ident_and_entity key result =
+  match first_entity result with
+  | Some entity -> (
+      match resolved_property_ident key entity with
+      | Ok ident -> Ok (ident, entity)
+      | Error err -> Error err)
   | None -> Error (property_not_found_error key)
 
 let resolve_property_ident invoke_config repo key =
@@ -1746,60 +1773,92 @@ let resolve_block_uuid_ref invoke_config repo uuid =
             (Error
                (Error.make Error.Block_not_found ("block not found: " ^ uuid))))
 
+let block_name_lookup_ref value =
+  match (Edn_util.as_vector value, Edn_util.as_list value) with
+  | Some values, _ when Vec.length values = 2 -> (
+      match
+        ( Edn_util.as_string_like (Vec.nth values 0),
+          Edn_util.as_string_like (Vec.nth values 1) )
+      with
+      | Some "block/name", Some name -> Some name
+      | _ -> None)
+  | _, Some values when Vec.length values = 2 -> (
+      match
+        ( Edn_util.as_string_like (Vec.nth values 0),
+          Edn_util.as_string_like (Vec.nth values 1) )
+      with
+      | Some "block/name", Some name -> Some name
+      | _ -> None)
+  | _ -> None
+
+(* A `[:block/name]` property value (date refs coerced from markdown
+   `key::`) keeps its lookup vec in the planned ops —
+   Add.materialize_name_lookups resolves it (creating the page when missing)
+   right before apply, once all read-only validation has succeeded, and
+   --dry-run surfaces it via would-create-pages. *)
 let rec resolve_property_value_refs invoke_config repo value =
   let open Cli_effect in
   match block_uuid_lookup_ref value with
   | Some uuid -> resolve_block_uuid_ref invoke_config repo uuid
   | None -> (
-      let resolve_values wrap values =
-        let rec loop acc remaining =
-          match Vec.pop_front remaining with
-          | None -> pure (Ok (wrap acc))
-          | Some (value, rest) ->
-              bind (resolve_property_value_refs invoke_config repo value)
-                (function
-                | Error err -> pure (Error err)
-                | Ok value -> loop (Vec.push_back acc value) rest)
-        in
-        loop Vec.empty values
-      in
-      match value with
-      | Melange_edn_melange.Any (Melange_edn_melange.Vector values) ->
-          resolve_values Edn_util.vector_vec (Edn_util.vec_of_array values)
-      | Any (List values) ->
-          resolve_values Edn_util.list_vec (Edn_util.vec_of_array values)
-      | Any (Set values) ->
-          resolve_values Edn_util.set_vec (Edn_util.vec_of_array values)
-      | Any (Map fields) ->
-          let rec loop acc remaining =
-            match Vec.pop_front remaining with
-            | None -> pure (Ok (Edn_util.map_vec acc))
-            | Some ((key, value), rest) ->
-                bind (resolve_property_value_refs invoke_config repo value)
-                  (function
-                  | Error err -> pure (Error err)
-                  | Ok value -> loop (Vec.push_back acc (key, value)) rest)
+      match block_name_lookup_ref value with
+      | Some _name -> pure (Ok value)
+      | None -> (
+          let resolve_values wrap values =
+            let rec loop acc remaining =
+              match Vec.pop_front remaining with
+              | None -> pure (Ok (wrap acc))
+              | Some (value, rest) ->
+                  bind
+                    (resolve_property_value_refs invoke_config repo
+                       value)
+                    (function
+                    | Error err -> pure (Error err)
+                    | Ok value -> loop (Vec.push_back acc value) rest)
+            in
+            loop Vec.empty values
           in
-          loop Vec.empty (Edn_util.vec_of_array fields)
-      | _ -> pure (Ok value))
+          match value with
+          | Melange_edn_melange.Any (Melange_edn_melange.Vector values) ->
+              resolve_values Edn_util.vector_vec
+                (Edn_util.vec_of_array values)
+          | Any (List values) ->
+              resolve_values Edn_util.list_vec (Edn_util.vec_of_array values)
+          | Any (Set values) ->
+              resolve_values Edn_util.set_vec (Edn_util.vec_of_array values)
+          | Any (Map fields) ->
+              let rec loop acc remaining =
+                match Vec.pop_front remaining with
+                | None -> pure (Ok (Edn_util.map_vec acc))
+                | Some ((key, value), rest) ->
+                    bind
+                      (resolve_property_value_refs invoke_config
+                         repo value)
+                      (function
+                      | Error err -> pure (Error err)
+                      | Ok value ->
+                          loop (Vec.push_back acc (key, value)) rest)
+              in
+              loop Vec.empty (Edn_util.vec_of_array fields)
+          | _ -> pure (Ok value)))
 
 let resolve_property_assignments invoke_config repo assignments =
   let open Cli_effect in
-  let rec loop acc remaining =
-    match Vec.pop_front remaining with
-    | None -> pure (Ok acc)
-    | Some (assignment, rest) ->
-        bind (resolve_property_ident invoke_config repo assignment.Property.key)
-          (function
-          | Error err -> pure (Error err)
-          | Ok ident ->
-              bind
-                (resolve_property_value_refs invoke_config repo assignment.value)
-                (function
-                | Error err -> pure (Error err)
-                | Ok value -> loop (Vec.push_back acc (ident, value)) rest))
-  in
-  loop Vec.empty assignments
+  Add.all_results
+    (Vec.map
+       (fun assignment ->
+         bind
+           (resolve_property_ident invoke_config repo assignment.Property.key)
+           (function
+           | Error err -> pure (Error err)
+           | Ok ident ->
+               map
+                 (function
+                   | Error err -> Error err
+                   | Ok value -> Ok (ident, value))
+                 (resolve_property_value_refs invoke_config repo
+                    assignment.value)))
+       assignments)
 
 let option_resolution_error option err =
   {
@@ -1814,86 +1873,420 @@ let option_resolution_error option err =
               |]));
   }
 
-let structural_block_field key =
-  match Edn_util.as_string_like key with
-  | Some key ->
-      key = "block/title" || key = "block/content" || key = "block/uuid"
-      || key = "block/children" || key = "block/tags"
-      || string_starts_with ~prefix:"db/" key
-      || string_starts_with ~prefix:"build/" key
-  | None -> false
+(* Looks up the full property entity for a block-level key:: assignment so
+   the value can be coerced to the property's schema type. *)
+let resolve_property_entity invoke_config repo key =
+  let open Cli_effect in
+  match key with
+  | Property.Key_ident ident ->
+      bind
+        (pull_entity_by_lookup invoke_config repo property_selector
+           (vector_vec (Vec.of_array [| kw "db/ident"; Edn_util.any ident |])))
+        (fun result -> pure (resolved_property_ident_and_entity key result))
+  | Key_id id ->
+      bind
+        (pull_entity_by_lookup invoke_config repo property_selector
+           (Edn_util.int64 id))
+        (fun result -> pure (resolved_property_ident_and_entity key result))
+  | Key_name name ->
+      bind (pull_property_by_name invoke_config repo name property_selector)
+        (fun result ->
+          match first_entity result with
+          | Some _ -> pure (resolved_property_ident_and_entity key result)
+          | None ->
+              let ident = Edn_util.keyword_t name in
+              bind
+                (pull_entity_by_lookup invoke_config repo property_selector
+                   (vector_vec
+                      (Vec.of_array [| kw "db/ident"; Edn_util.any ident |])))
+                (fun result ->
+                  pure (resolved_property_ident_and_entity key result)))
 
-let inline_property_assignments block =
-  match Edn_util.as_map block.Block.raw with
-  | None -> Ok Vec.empty
-  | Some fields ->
-      let rec loop acc remaining =
-        match Vec.pop_front remaining with
-        | None -> Ok acc
-        | Some ((key, value), rest) -> (
-            if structural_block_field key then loop acc rest
-            else
-              match Property.parse_key key with
-              | Some key ->
-                  loop (Vec.push_back acc { Property.key; value }) rest
+let strip_page_ref_syntax text =
+  let length = String.length text in
+  if
+    length >= 4
+    && String.sub text 0 2 = "[["
+    && String.sub text (length - 2) 2 = "]]"
+  then String.sub text 2 (length - 4)
+  else text
+
+(* Coerces a markdown key:: value (always a string) to the property's schema
+   type; name-typed ref values become [:block/name] lookups that
+   materialize_name_lookups resolves (creating missing pages) or
+   would-create-pages reports under --dry-run. *)
+let coerce_block_property_value entity value =
+  match Edn_util.as_string value with
+  | None -> Ok value
+  | Some text -> (
+      let property_type =
+        Option.bind
+          (Edn_util.get entity "logseq.property/type")
+          Edn_util.as_keyword
+      in
+      match property_type with
+      | Some "number" -> (
+          match Int64.of_string_opt (String.trim text) with
+          | Some number -> Ok (Edn_util.int64 number)
+          | None -> (
+              match float_of_string_opt (String.trim text) with
+              | Some number -> Ok (Edn_util.float number)
               | None ->
                   Error
                     (Error.invalid_options
-                       ("invalid block property key: "
-                       ^ Melange_edn_melange.to_edn_string key)))
-      in
-      loop Vec.empty fields
+                       ("property value is not a number: " ^ text))))
+      | Some "checkbox" -> (
+          match String.trim text with
+          | "true" -> Ok (Edn_util.bool true)
+          | "false" -> Ok (Edn_util.bool false)
+          | _ ->
+              Error
+                (Error.invalid_options
+                   ("property value is not a boolean: " ^ text)))
+      | Some "datetime" -> (
+          match Time.parse_time (String.trim text) with
+          | Some time -> Ok (Edn_util.float (Js.Date.getTime time))
+          | None ->
+              Error
+                (Error.invalid_options
+                   ("property value is not a datetime: " ^ text)))
+      | Some "date" ->
+          let text = String.trim text in
+          if Cli_primitive.is_uuid_string text then
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array [| kw "block/uuid"; Edn_util.uuid text |]))
+          else
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array
+                    [|
+                      kw "block/name";
+                      Edn_util.string (strip_page_ref_syntax text);
+                    |]))
+      | Some "page" ->
+          let text = String.trim text in
+          if Cli_primitive.is_uuid_string text then
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array [| kw "block/uuid"; Edn_util.uuid text |]))
+          else
+            (* A raw string reaches the worker's :page branch, whose
+               create! call lacks split-namespace? — `a/b` titles throw.
+               A [:block/name] lookup lets materialize create the page
+               (namespace-aware) and rewrite to an entity id. *)
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array
+                    [|
+                      kw "block/name";
+                      Edn_util.string (strip_page_ref_syntax text);
+                    |]))
+      | Some "default" ->
+          (* Ref-typed default values (closed enums like
+             logseq.property/status, open text values) are resolved
+             downstream by resolve_default_property_value, which needs the
+             raw string — including any [[ ]] syntax — to pick a closed
+             value or pass the text through for open properties. *)
+          let text = String.trim text in
+          if Cli_primitive.is_uuid_string text then
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array [| kw "block/uuid"; Edn_util.uuid text |]))
+          else Ok value
+      | Some ("node" | "entity" | "class" | "property" | "asset") ->
+          let text = String.trim text in
+          if Cli_primitive.is_uuid_string text then
+            Ok
+              (Edn_util.vector_vec
+                 (Vec.of_array [| kw "block/uuid"; Edn_util.uuid text |]))
+          else Ok (Edn_util.string (strip_page_ref_syntax text))
+      | _ -> Ok value)
 
-let rec resolve_block_inline_properties invoke_config repo block =
-  let open Cli_effect in
-  match inline_property_assignments block with
-  | Error err -> pure (Error err)
-  | Ok assignments ->
-      bind (resolve_property_assignments invoke_config repo assignments)
-        (function
-        | Error err -> pure (Error (option_resolution_error "--blocks" err))
-        | Ok resolved_assignments ->
-            let resolved_properties =
-              Vec.map
-                (fun (ident, value) ->
-                  { Property.key = Property.Key_ident ident; value })
-                resolved_assignments
-            in
-            let rec resolve_children acc remaining =
-              match Vec.pop_front remaining with
-              | None -> pure (Ok acc)
-              | Some (child, rest) ->
-                  bind
-                    (resolve_block_inline_properties invoke_config repo child)
-                    (function
-                    | Error err -> pure (Error err)
-                    | Ok child ->
-                        resolve_children (Vec.push_back acc child) rest)
-            in
-            bind (resolve_children Vec.empty block.Block.children) (function
-              | Error err -> pure (Error err)
-              | Ok children ->
-                  pure
-                    (Ok
-                       {
-                         block with
-                         Block.properties =
-                           Vec.append block.Block.properties resolved_properties;
-                         children;
-                       })))
+let closed_value_selector =
+  vector_vec
+    (Vec.of_array
+       [|
+         kw "db/id";
+         kw "db/ident";
+         kw "block/title";
+         kw "logseq.property/value";
+       |])
 
-let resolve_blocks_inline_properties invoke_config repo blocks =
+let closed_values_query =
+  Cli_primitive.make_datascript_query
+    ~find:
+      (Vec.singleton
+         (vector_vec
+            (Vec.of_array
+               [|
+                 list_vec
+                   (Vec.of_array
+                      [| sym "pull"; sym "?e"; closed_value_selector |]);
+                 sym "...";
+               |])))
+    ~in_:
+      (Vec.of_array
+         [| Melange_edn_melange.symbol "$"; Melange_edn_melange.symbol "?prop" |])
+    ~where:
+      (Vec.singleton
+         (Cli_primitive.V
+            (Edn_util.vector_t_vec
+               (Vec.of_array
+                  [|
+                    sym "?e";
+                    kw "block/closed-value-property";
+                    sym "?prop";
+                  |]))))
+    ()
+
+(* Resolves a `key::` word against the property's closed-value entities
+   (e.g. `status:: todo` -> the `logseq.property/status.todo` value entity).
+   A property with closed values rejects non-matching words; a property with
+   none is an open default value, so the raw string passes through — the
+   worker validates it as a new value and creates the text block itself. *)
+let closed_values invoke_config repo property_id =
+  Transport.thread_api_q invoke_config ~repo
+    ~query:
+      (Edn_util.vector_t_vec
+         (Vec.of_array
+            [| query_value closed_values_query; Edn_util.int64 property_id |]))
+
+let closed_value_display value_entity =
+  match Edn_util.get value_entity "logseq.property/value" with
+  | Some pv -> (
+      match Edn_util.as_string_like pv with
+      | Some value -> value
+      | None -> (
+          match Edn_util.as_int64 pv with
+          | Some n -> Int64.to_string n
+          | None -> (
+              match Edn_util.get_string value_entity "block/title" with
+              | Some title -> title
+              | None -> "?")))
+  | None -> Option.value (Edn_util.get_string value_entity "block/title") ~default:"?"
+
+let closed_value_of_result ~property_type result text value =
+  let bare = strip_page_ref_syntax text in
+  let values = Option.value (Edn_util.as_seq result) ~default:Vec.empty in
+  if Vec.is_empty values then Ok value
+  else
+    let token value =
+      value |> String.trim |> String.lowercase_ascii
+      |> String.map (function ' ' | '_' -> '-' | c -> c)
+    in
+    let wanted = token bare in
+    let matches value = String.equal (token value) wanted in
+    let matched =
+      Vec.find_map
+        (fun value_entity ->
+          match id_of_entity value_entity with
+          | None -> None
+          | Some id ->
+              let hit =
+                match property_type with
+                (* Closed number/url values match the literal the worker's
+                   closed-value check reads: numbers live in
+                   logseq.property/value (int or float), urls in
+                   block/title. *)
+                | "number" -> (
+                    let stored =
+                      Edn_util.get value_entity "logseq.property/value"
+                    in
+                    match
+                      ( Option.bind stored Edn_util.as_int64,
+                        Edn_util.as_int64 value )
+                    with
+                    | Some stored, Some wanted -> Int64.equal stored wanted
+                    | _ -> (
+                        (* Float fallback only when either side is not an
+                           integer — Int64->float conversion would round
+                           distinct large integers together. *)
+                        let as_number v =
+                          match
+                            (Edn_util.as_int64 v, Edn_util.as_float v)
+                          with
+                          | Some n, _ -> Some (Int64.to_float n)
+                          | _, Some f -> Some f
+                          | _ -> None
+                        in
+                        match (Option.bind stored as_number, as_number value) with
+                        | Some stored, Some wanted ->
+                            Float.equal stored wanted
+                        | _ -> false))
+                | "url" -> (
+                    let literal =
+                      match
+                        Edn_util.get_string value_entity
+                          "logseq.property/value"
+                      with
+                      | Some v -> Some v
+                      | None ->
+                          Edn_util.get_string value_entity "block/title"
+                    in
+                    match literal with
+                    | Some stored ->
+                        String.equal (String.trim stored) (String.trim text)
+                    | None -> false)
+                | _ ->
+                    let title_hit =
+                      match Edn_util.get_string value_entity "block/title" with
+                      | Some title -> matches title
+                      | None -> false
+                    in
+                    let ident_hit =
+                      match Edn_util.get_string value_entity "db/ident" with
+                      | Some ident -> (
+                          (* Closed-value idents come in both `ns.prop/value`
+                             and `ns.prop.value` shapes — match on the tail
+                             after the last separator. *)
+                          let cut =
+                            List.filter_map (String.rindex_opt ident)
+                              [ '.'; '/' ]
+                            |> List.fold_left max (-1)
+                          in
+                          if cut < 0 then matches ident
+                          else
+                            matches
+                              (String.sub ident (cut + 1)
+                                 (String.length ident - cut - 1)))
+                      | None -> false
+                    in
+                    let literal_hit =
+                      match
+                        Edn_util.get_string value_entity
+                          "logseq.property/value"
+                      with
+                      | Some literal -> matches literal
+                      | None -> false
+                    in
+                    title_hit || ident_hit || literal_hit
+              in
+              if hit then Some id else None)
+        values
+    in
+    match matched with
+    | Some id -> Ok (Edn_util.int64 id)
+    | None ->
+        let choices =
+          values
+          |> Vec.map closed_value_display
+          |> Vec.to_list
+          |> List.map (fun value -> "\"" ^ value ^ "\"")
+          |> String.concat ", "
+        in
+        Error
+          (Error.invalid_options
+             (Printf.sprintf
+                "unknown value \"%s\" for closed property; choices: %s" bare
+                choices))
+
+let resolve_block_property_assignments ~entity_memo ~closed_memo
+    invoke_config repo assignments =
   let open Cli_effect in
-  let rec loop acc remaining =
-    match Vec.pop_front remaining with
-    | None -> pure (Ok acc)
-    | Some (block, rest) ->
-        bind (resolve_block_inline_properties invoke_config repo block)
+  (* The same `key::` can repeat on many blocks; effects fire on
+     construction, so memoizing the effect shares one HTTP request. *)
+  let property_entity key =
+    match Hashtbl.find_opt entity_memo key with
+    | Some eff -> eff
+    | None ->
+        let eff = resolve_property_entity invoke_config repo key in
+        Hashtbl.add entity_memo key eff;
+        eff
+  in
+  let closed_values_of property_id =
+    match Hashtbl.find_opt closed_memo property_id with
+    | Some eff -> eff
+    | None ->
+        let eff = closed_values invoke_config repo property_id in
+        Hashtbl.add closed_memo property_id eff;
+        eff
+  in
+  Add.all_results
+    (Vec.map
+       (fun assignment ->
+         bind
+           (property_entity assignment.Property.key)
+           (function
+           | Error err -> pure (Error err)
+           | Ok (ident, entity) -> (
+               match
+                 coerce_block_property_value entity assignment.value
+               with
+               | Error err -> pure (Error err)
+               | Ok value ->
+                   bind
+                     (match
+                        ( Edn_util.get_string entity "logseq.property/type",
+                          Edn_util.as_string assignment.Property.value )
+                      with
+                     | Some property_type, Some text
+                       when List.mem property_type
+                              [ "default"; "number"; "url" ] -> (
+                         match
+                           ( Option.bind
+                               (Edn_util.get entity "db/valueType")
+                               Edn_util.as_keyword,
+                             id_of_entity entity )
+                         with
+                         | Some "db.type/ref", Some property_id ->
+                             map
+                               (fun result ->
+                                 closed_value_of_result ~property_type result
+                                   (String.trim text) value)
+                               (closed_values_of property_id)
+                         | _ -> pure (Ok value))
+                     | _ -> pure (Ok value))
+                     (function
+                     | Error err -> pure (Error err)
+                     | Ok value ->
+                         map
+                           (function
+                             | Error err -> Error err
+                             | Ok value -> Ok (ident, value))
+                           (resolve_property_value_refs invoke_config repo
+                              value)))))
+       assignments)
+
+let rec resolve_block_inline_properties ~dry_run ~entity_memo ~closed_memo
+    invoke_config repo block =
+  let open Cli_effect in
+  bind
+    (resolve_block_property_assignments ~entity_memo ~closed_memo
+       invoke_config repo block.Block.properties) (function
+    | Error err -> pure (Error (option_resolution_error "--blocks" err))
+    | Ok resolved_assignments ->
+        let resolved_properties =
+          Vec.map
+            (fun (ident, value) ->
+              { Property.key = Property.Key_ident ident; value })
+            resolved_assignments
+        in
+        bind
+          (Add.all_results
+             (Vec.map
+                (resolve_block_inline_properties ~dry_run ~entity_memo
+                   ~closed_memo invoke_config repo)
+                block.Block.children))
           (function
           | Error err -> pure (Error err)
-          | Ok block -> loop (Vec.push_back acc block) rest)
-  in
-  loop Vec.empty blocks
+          | Ok children ->
+              pure
+                (Ok
+                   { block with
+                     Block.properties = resolved_properties;
+                     children })))
+
+let resolve_blocks_inline_properties ~dry_run invoke_config repo blocks =
+  (* Memo tables live for the whole command so the same `key::` across any
+     blocks resolves once. *)
+  let entity_memo = Hashtbl.create 4 in
+  let closed_memo = Hashtbl.create 4 in
+  Add.all_results
+    (Vec.map
+       (resolve_block_inline_properties ~dry_run ~entity_memo ~closed_memo
+          invoke_config repo)
+       blocks)
 
 let rec strip_block_properties block =
   {
@@ -1934,14 +2327,6 @@ let rec block_inline_property_ops block =
     (Vec.concat_map block_inline_property_ops block.Block.children)
 
 let inline_property_ops blocks = Vec.concat_map block_inline_property_ops blocks
-
-let apply_inline_property_ops invoke_config repo blocks =
-  let open Cli_effect in
-  let ops = inline_property_ops blocks in
-  if Vec.is_empty ops then pure (Ok Edn_util.nil)
-  else
-    bind (apply_outliner_ops invoke_config repo ops) (fun result ->
-        pure (Ok result))
 
 let append_tag_and_property_ops block_uuids ~update_tag_ids ~remove_tag_ids
     ~update_properties ~remove_properties =
@@ -2045,71 +2430,61 @@ let resolve_update_plan invoke_config repo plan =
                                  update_properties,
                                  remove_properties ))))))
 
-let apply_resolved_update_plan invoke_config repo block_uuids
+let resolved_update_plan_ops block_uuids
     (update_tag_ids, remove_tag_ids, update_properties, remove_properties) =
+  append_tag_and_property_ops block_uuids ~update_tag_ids ~remove_tag_ids
+    ~update_properties ~remove_properties
+
+let apply_resolved_update_plan invoke_config repo block_uuids resolved =
   let open Cli_effect in
-  let ops =
-    append_tag_and_property_ops block_uuids ~update_tag_ids ~remove_tag_ids
-      ~update_properties ~remove_properties
-  in
+  let ops = resolved_update_plan_ops block_uuids resolved in
   if Vec.is_empty ops then pure (Ok Edn_util.nil)
   else
     bind (apply_outliner_ops invoke_config repo ops) (fun result ->
         pure (Ok result))
 
-let execute_plan_on_uuids invoke_config repo block_uuids plan =
+let resolve_page_update_plan invoke_config repo plan =
   let open Cli_effect in
-  bind (resolve_update_plan invoke_config repo plan) (function
-    | Error err -> pure (Error err)
-    | Ok resolved ->
-        apply_resolved_update_plan invoke_config repo block_uuids resolved)
+  map
+    (function
+      | Error err -> Error err
+      | Ok ((_, _, update_properties, _) as resolved) ->
+          if
+            Vec.exists
+              (fun (ident, _) ->
+                Edn_util.keyword_to_string ident = "block/title")
+              update_properties
+          then
+            Error
+              (Error.invalid_options
+                 "page :block/title cannot be updated via --update-properties; \
+                  use --rename")
+          else Ok resolved)
+    (resolve_update_plan invoke_config repo plan)
 
-let execute_page_plan invoke_config repo page_uuid plan =
-  execute_plan_on_uuids invoke_config repo (Vec.singleton page_uuid) plan
+let restore_recycled_page_op page_uuid =
+  vector_vec
+    (Vec.of_array
+       [|
+         kw "restore-recycled";
+         vector_vec (Vec.of_array [| Edn_util.uuid page_uuid |]);
+       |])
 
 let restore_recycled_page invoke_config repo page_uuid =
   apply_outliner_ops invoke_config repo
-    (Vec.singleton
-       (vector_vec
-          (Vec.of_array
-             [|
-               kw "restore-recycled";
-               vector_vec (Vec.of_array [| Edn_util.uuid page_uuid |]);
-             |])))
+    (Vec.singleton (restore_recycled_page_op page_uuid))
 
 let pull_created_page invoke_config repo name create_result =
-  let uuid_value =
-    match
-      (Edn_util.as_vector create_result, Edn_util.as_list create_result)
-    with
-    | Some values, _ -> Vec.nth_opt values 1
-    | _, Some values -> Vec.nth_opt values 1
-    | _ -> None
-  in
-  match uuid_value with
-  | Some uuid_value -> (
-      match Edn_util.as_string_like uuid_value with
-      | Some uuid ->
-          Transport.thread_api_pull invoke_config ~repo
-            ~selector:
-              (Edn_util.vector_t_vec
-                 (Vec.of_array [| kw "db/id"; kw "block/uuid" |]))
-            ~lookup:
-              (vector_vec
-                 (Vec.of_array [| kw "block/uuid"; Edn_util.uuid uuid |]))
-      | _ ->
-          Transport.thread_api_pull invoke_config ~repo
-            ~selector:
-              (Edn_util.vector_t_vec
-                 (Vec.of_array [| kw "db/id"; kw "block/uuid" |]))
-            ~lookup:
-              (vector_vec
-                 (Vec.of_array
-                    [|
-                      kw "block/name";
-                      Edn_util.string (normalized_lookup_name name);
-                    |])))
-  | _ ->
+  match Add.created_page_uuid create_result with
+  | Some uuid ->
+      Transport.thread_api_pull invoke_config ~repo
+        ~selector:
+          (Edn_util.vector_t_vec
+             (Vec.of_array [| kw "db/id"; kw "block/uuid" |]))
+        ~lookup:
+          (vector_vec
+             (Vec.of_array [| kw "block/uuid"; Edn_util.uuid uuid |]))
+  | None ->
       Transport.thread_api_pull invoke_config ~repo
         ~selector:
           (Edn_util.vector_t_vec
@@ -2314,7 +2689,7 @@ let save_block_title invoke_config repo uuid content =
     Edn_util.vector_vec
       (Vec.of_array
          [|
-           kw "save-block";
+           kw "logseq.outliner/save-block-input";
            Edn_util.vector_vec
              (Vec.of_array [| block; Edn_util.map_vec Vec.empty |]);
          |])
@@ -2456,7 +2831,7 @@ let execute_create_asset mode config repo path create_action =
                           in
                           try
                             copy_file path destination;
-                            bind (Add.execute_add_block add_action config mode)
+                            bind (Add.execute_add_block ~extra_ops:Vec.empty add_action config mode)
                               (fun result ->
                                 if Cli_result.is_error result then pure result
                                 else
@@ -2675,18 +3050,49 @@ let execute_task_update mode invoke_config repo id uuid status_input
                            (upsert_id_not_found "task"
                               (Option.value id ~default:0L))))))
 
-let page_result_with_plan ?(restore = false) mode invoke_config repo page_id
+let page_result_with_resolved_plan ?(restore = false) ?rename mode invoke_config
+    repo page_id page_uuid resolved =
+  let open Cli_effect in
+  let update_effect =
+    match rename with
+    | Some name ->
+        let ops =
+          Vec.push_front
+            (resolved_update_plan_ops (Vec.singleton page_uuid) resolved)
+            (rename_page_op page_uuid name)
+        in
+        let ops =
+          if restore then
+            Vec.push_front ops (restore_recycled_page_op page_uuid)
+          else ops
+        in
+        map
+          (fun result -> Ok result)
+          (apply_outliner_ops invoke_config repo ops)
+    | None ->
+        let restore_effect =
+          if restore then restore_recycled_page invoke_config repo page_uuid
+          else pure Edn_util.nil
+        in
+        bind restore_effect (fun _ ->
+            apply_resolved_update_plan invoke_config repo
+              (Vec.singleton page_uuid) resolved)
+  in
+  map
+    (function
+      | Error err -> Cli_result.error ~command:Command_id.Upsert_page mode err
+      | Ok _ -> ok_page_ids mode (Vec.singleton page_id))
+    update_effect
+
+let page_result_with_plan ?restore ?rename mode invoke_config repo page_id
     page_uuid plan =
   let open Cli_effect in
-  let restore_effect =
-    if restore then restore_recycled_page invoke_config repo page_uuid
-    else pure Edn_util.nil
-  in
-  bind restore_effect (fun _ ->
-      bind (execute_page_plan invoke_config repo page_uuid plan) (function
-        | Error err ->
-            pure (Cli_result.error ~command:Command_id.Upsert_page mode err)
-        | Ok _ -> pure (ok_page_ids mode (Vec.singleton page_id))))
+  bind (resolve_page_update_plan invoke_config repo plan) (function
+    | Error err ->
+        pure (Cli_result.error ~command:Command_id.Upsert_page mode err)
+    | Ok resolved ->
+        page_result_with_resolved_plan ?restore ?rename mode invoke_config repo
+          page_id page_uuid resolved)
 
 let execute_create_page mode invoke_config repo name restore plan =
   let open Cli_effect in
@@ -2714,45 +3120,102 @@ let execute_create_page mode invoke_config repo name restore plan =
                   (Cli_result.error ~command:Command_id.Upsert_page mode
                      (page_not_found ())))
       | None ->
-          bind (create_page invoke_config repo name) (fun create_result ->
-              bind (pull_created_page invoke_config repo name create_result)
-                (fun page ->
-                  match (id_of_entity page, uuid_of_entity page) with
-                  | Some id, Some uuid ->
-                      page_result_with_plan mode invoke_config repo id uuid plan
-                  | Some id, None -> pure (ok_page_ids mode (Vec.singleton id))
-                  | _ ->
-                      pure
-                        (Cli_result.error ~command:Command_id.Upsert_page mode
-                           (page_not_found ())))))
+          bind (resolve_page_update_plan invoke_config repo plan) (function
+            | Error err ->
+                pure (Cli_result.error ~command:Command_id.Upsert_page mode err)
+            | Ok resolved ->
+                bind (create_page invoke_config repo name) (fun create_result ->
+                    bind
+                      (pull_created_page invoke_config repo name create_result)
+                      (fun page ->
+                        match (id_of_entity page, uuid_of_entity page) with
+                        | Some id, Some uuid ->
+                            page_result_with_resolved_plan mode invoke_config
+                              repo id uuid resolved
+                        | Some id, None ->
+                            pure (ok_page_ids mode (Vec.singleton id))
+                        | _ ->
+                            pure
+                              (Cli_result.error ~command:Command_id.Upsert_page
+                                 mode (page_not_found ()))))))
 
-let execute_update_page mode invoke_config repo id restore plan =
+let execute_update_page_entity ?rename mode invoke_config repo entity restore
+    plan =
   let open Cli_effect in
-  bind (pull_entity_by_id invoke_config repo page_selector id) (fun entity ->
-      match id_of_entity entity with
-      | None ->
-          pure
-            (Cli_result.error ~command:Command_id.Upsert_page mode
-               (upsert_id_not_found "page" id))
-      | Some id when not (page_entity entity) ->
-          pure
-            (Cli_result.error ~command:Command_id.Upsert_page mode
-               (upsert_id_type_mismatch "Page" id))
-      | Some _ when recycled_entity entity && not restore ->
+  match id_of_entity entity with
+  | None ->
+      pure
+        (Cli_result.error ~command:Command_id.Upsert_page mode
+           (page_not_found ()))
+  | Some id when not (page_entity entity) ->
+      pure
+        (Cli_result.error ~command:Command_id.Upsert_page mode
+           (if Option.is_some rename && Option.is_none (uuid_of_entity entity)
+            then page_not_found ()
+            else upsert_id_type_mismatch "Page" id))
+  | Some _ when recycled_entity entity && not restore ->
+      pure
+        (Cli_result.error ~command:Command_id.Upsert_page mode
+           (recycled_page_error ()))
+  | Some id -> (
+      let recycled = recycled_entity entity in
+      match uuid_of_entity entity with
+      | Some uuid ->
+          page_result_with_plan ?rename ~restore:recycled mode invoke_config
+            repo id uuid plan
+      | None when recycled ->
           pure
             (Cli_result.error ~command:Command_id.Upsert_page mode
                (recycled_page_error ()))
-      | Some id -> (
-          let recycled = recycled_entity entity in
-          match uuid_of_entity entity with
-          | Some uuid ->
-              page_result_with_plan ~restore:recycled mode invoke_config repo id
-                uuid plan
-          | None when recycled ->
-              pure
-                (Cli_result.error ~command:Command_id.Upsert_page mode
-                   (recycled_page_error ()))
-          | None -> pure (ok_page_ids mode (Vec.singleton id))))
+      | None when Option.is_some rename ->
+          pure
+            (Cli_result.error ~command:Command_id.Upsert_page mode
+               (Error.make Error.Upsert_id_not_found "page uuid not found"))
+      | None -> pure (ok_page_ids mode (Vec.singleton id)))
+
+let execute_update_page ?rename mode invoke_config repo id restore plan =
+  let open Cli_effect in
+  bind (pull_entity_by_id invoke_config repo page_selector id) (fun entity ->
+      if Option.is_none (id_of_entity entity) && Option.is_none rename then
+        pure
+          (Cli_result.error ~command:Command_id.Upsert_page mode
+             (upsert_id_not_found "page" id))
+      else
+        execute_update_page_entity ?rename mode invoke_config repo entity
+          restore plan)
+
+let execute_rename_page_by_name mode invoke_config repo name rename restore plan
+    =
+  let open Cli_effect in
+  bind (pull_pages_by_name invoke_config repo name page_selector)
+    (fun pages ->
+      let matches =
+        match Edn_util.as_seq pages with
+        | Some pages -> pages
+        | None -> invalid_arg "page query must return a sequence"
+      in
+      match Vec.length matches with
+      | 0 ->
+          pure
+            (Cli_result.error ~command:Command_id.Upsert_page mode
+               (page_not_found ()))
+      | 1 ->
+          execute_update_page_entity ~rename mode invoke_config repo
+            (Vec.nth matches 0) restore plan
+      | _ ->
+          let candidates =
+            Vec.map
+              (fun entity ->
+                {
+                  Error.id = id_of_entity entity;
+                  name = Edn_util.get_string entity "block/title";
+                })
+              matches
+          in
+          pure
+            (Cli_result.error ~command:Command_id.Upsert_page mode
+               (Error.make ~candidates Error.Ambiguous_page_name
+                  ("multiple pages match name: " ^ name ^ "; rerun with --id"))))
 
 let update_plan_empty (plan : Property.update_plan) =
   Vec.is_empty plan.update_tags
@@ -2811,7 +3274,7 @@ let execute_task_create mode config invoke_config repo target_page content
                   tags_edn = None;
                   properties_edn = None;
                   content = Some content;
-                  blocks_edn = None;
+                  blocks_markdown = None;
                   blocks_file = None;
                 }
               in
@@ -2820,7 +3283,7 @@ let execute_task_create mode config invoke_config repo target_page content
                   pure
                     (Cli_result.error ~command:Command_id.Upsert_task mode err)
               | Ok create_action ->
-                  bind (Add.execute_add_block create_action config mode)
+                  bind (Add.execute_add_block ~extra_ops:Vec.empty create_action config mode)
                     (fun result ->
                       if Cli_result.is_error result then
                         pure
@@ -2868,8 +3331,8 @@ let execute_create_block mode (action : block_create) config =
         pure (Cli_result.error ~command:Command_id.Upsert_block mode err)
     | Ok invoke_config ->
         bind
-          (resolve_blocks_inline_properties invoke_config action.repo
-             action.blocks) (function
+          (resolve_blocks_inline_properties ~dry_run:action.dry_run
+             invoke_config action.repo action.blocks) (function
           | Error err ->
               pure (Cli_result.error ~command:Command_id.Upsert_block mode err)
           | Ok blocks ->
@@ -2880,7 +3343,8 @@ let execute_create_block mode (action : block_create) config =
                   map
                     (function
                       | Ok plan -> Ok (Some plan) | Error err -> Error err)
-                    (resolve_update_plan invoke_config action.repo
+                    (resolve_update_plan
+                       invoke_config action.repo
                        action.update_plan)
               in
               bind resolved_plan_effect (function
@@ -2896,55 +3360,18 @@ let execute_create_block mode (action : block_create) config =
                           blocks = Vec.map strip_block_properties action.blocks;
                         }
                     in
-                    bind (Add.execute_add_block add_action config mode)
-                      (fun result ->
-                        if Cli_result.is_error result then pure result
-                        else
-                          bind
-                            (apply_inline_property_ops invoke_config action.repo
-                               action.blocks) (function
-                            | Error err ->
-                                pure
-                                  (Cli_result.error
-                                     ~command:Command_id.Upsert_block mode err)
-                            | Ok _ -> (
-                                match resolved_plan with
-                                | None -> pure result
-                                | Some resolved_plan -> (
-                                    match result_ids_of_cli_result result with
-                                    | None ->
-                                        pure
-                                          (Cli_result.error
-                                             ~command:Command_id.Upsert_block
-                                             mode
-                                             (Error.make
-                                                Error.Add_id_resolution_failed
-                                                "unable to resolve created ids"))
-                                    | Some ids ->
-                                        bind
-                                          (resolve_block_uuids_by_id
-                                             invoke_config action.repo ids)
-                                          (function
-                                          | Error err ->
-                                              pure
-                                                (Cli_result.error
-                                                   ~command:
-                                                     Command_id.Upsert_block
-                                                   mode err)
-                                          | Ok block_uuids ->
-                                              bind
-                                                (apply_resolved_update_plan
-                                                   invoke_config action.repo
-                                                   block_uuids resolved_plan)
-                                                (function
-                                                | Error err ->
-                                                    pure
-                                                      (Cli_result.error
-                                                         ~command:
-                                                           Command_id
-                                                           .Upsert_block mode
-                                                         err)
-                                                | Ok _ -> pure result)))))))))
+                    let extra_ops =
+                      Vec.append
+                        (inline_property_ops action.blocks)
+                        (match resolved_plan with
+                        | None -> Vec.empty
+                        | Some resolved_plan ->
+                            resolved_update_plan_ops
+                              (block_uuids_of_add_action add_action)
+                              resolved_plan)
+                    in
+                    Add.execute_add_block ~extra_ops ~dry_run:action.dry_run
+                      add_action config mode)))
 
 let execute_with_mode action config mode =
   let open Cli_effect in
@@ -2992,24 +3419,23 @@ let execute_with_mode action config mode =
       pure
         (Cli_result.error ~command:Command_id.Upsert_tag mode
            (Error.make Error.Not_implemented "upsert tag is not implemented"))
-  | Upsert_page { repo; mode = Create; page = Some page; restore; plan; _ } ->
+  | Upsert_page { repo; mode = page_mode; id; page; rename; restore; plan; _ }
+    ->
       bind (Server_runtime.ensure_server config repo ~create_empty_db:false)
         (function
         | Error err ->
             pure (Cli_result.error ~command:Command_id.Upsert_page mode err)
-        | Ok invoke_config ->
-            execute_create_page mode invoke_config repo page restore plan)
-  | Upsert_page { repo; mode = Update; id = Some id; restore; plan; _ } ->
-      bind (Server_runtime.ensure_server config repo ~create_empty_db:false)
-        (function
-        | Error err ->
-            pure (Cli_result.error ~command:Command_id.Upsert_page mode err)
-        | Ok invoke_config ->
-            execute_update_page mode invoke_config repo id restore plan)
-  | Upsert_page _ ->
-      pure
-        (Cli_result.error ~command:Command_id.Upsert_page mode
-           (Error.make Error.Not_implemented "upsert page is not implemented"))
+        | Ok invoke_config -> (
+            match (page_mode, id, page, rename) with
+            | Create, None, Some page, None ->
+                execute_create_page mode invoke_config repo page restore plan
+            | Update, Some id, _, rename ->
+                execute_update_page ?rename mode invoke_config repo id restore
+                  plan
+            | Update, None, Some page, Some rename ->
+                execute_rename_page_by_name mode invoke_config repo page rename
+                  restore plan
+            | _ -> invalid_arg "invalid upsert page action"))
   | Upsert_property { repo; mode = Create; name = Some name; schema; _ } ->
       bind (Server_runtime.ensure_server config repo ~create_empty_db:false)
         (function
@@ -3138,8 +3564,10 @@ let metadata () =
                "logseq upsert block --graph my-graph --target-page Meeting \
                 Notes --content \"AI summary of the discussion\" --update-tags \
                 '[\"AI-GENERATED\"]'";
-               "logseq upsert block --graph my-graph --blocks '[{:block/title \
-                \"A\"} {:block/title \"B\"}]'";
+               "logseq upsert block --graph my-graph --target-page Home \
+                --blocks '- Parent'";
+               "logseq upsert block --graph my-graph --target-page Home \
+                --blocks-file ./blocks.md --dry-run";
              |])
         Command_id.Upsert_block "Upsert block";
       meta
@@ -3148,6 +3576,8 @@ let metadata () =
              [|
                "logseq upsert page --graph my-graph --page Home --update-tags \
                 '[\"project\"]'";
+               "logseq upsert page --graph my-graph --page Home --rename \"New \
+                Home\"";
                "logseq upsert page --graph my-graph --id 999 \
                 --update-properties '{:logseq.property/description \
                 \"Example\"}'";

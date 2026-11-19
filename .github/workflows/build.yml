@@ -15,7 +15,7 @@ env:
   JAVA_VERSION: '21'
   # This is the latest node version we can run.
   NODE_VERSION: '24'
-  OCAML_VERSION: '5.4.0'
+  OCAML_VERSION: '5.1.1'
   BABASHKA_VERSION: '1.12.215'
 
 jobs:
@@ -83,7 +83,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build test asset
-        run: clojure -M:test compile test
+        run: pnpm cljs:test
 
       - name: Run ClojureScript query tests against basic query type
         run: DB_QUERY_TYPE=basic pnpm cljs:run-test -r frontend.db.query-dsl-test
@@ -180,6 +180,12 @@ jobs:
           cli: ${{ env.CLOJURE_VERSION }}
           bb: ${{ env.BABASHKA_VERSION }}
 
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-build-maven-v1-${{ github.job }}-java-${{ env.JAVA_VERSION }}-clojure-${{ env.CLOJURE_VERSION }}-babashka-${{ env.BABASHKA_VERSION }}-${{ hashFiles('**/deps.edn', '**/nbb.edn', '**/bb.edn') }}
+
       - name: Run clj-kondo lint
         run: clojure -M:clj-kondo --parallel --lint src
 
@@ -239,6 +245,12 @@ jobs:
         with:
           cli: ${{ env.CLOJURE_VERSION }}
           bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-build-maven-v1-${{ github.job }}-java-${{ env.JAVA_VERSION }}-clojure-${{ env.CLOJURE_VERSION }}-babashka-${{ env.BABASHKA_VERSION }}-${{ hashFiles('**/deps.edn', '**/nbb.edn', '**/bb.edn') }}
 
       - name: Set up OCaml
         uses: ocaml/setup-ocaml@v3

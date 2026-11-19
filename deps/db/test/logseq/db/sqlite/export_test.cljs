@@ -856,6 +856,26 @@
     (is (= (expand-properties (:properties original-data)) (:properties imported-nodes)))
     (is (= (expand-classes (:classes original-data)) (:classes imported-nodes)))))
 
+(deftest export-grouped-view-nodes-by-uuid
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "page"}
+                 :blocks [{:block/title "Alpha"}
+                          {:block/title "Beta"}]}]})
+        block-uuids (mapv :block/uuid
+                          [(db-test/find-block-by-content @conn "Alpha")
+                           (db-test/find-block-by-content @conn "Beta")])
+        exported (sqlite-export/build-export
+                  @conn
+                  {:export-type :view-nodes
+                   :rows [["group" block-uuids]]
+                   :group-by? true})]
+    (is (= #{"Alpha" "Beta"}
+           (->> (:pages-and-blocks exported)
+                (mapcat :blocks)
+                (map :block/title)
+                set)))))
+
 (deftest import-selected-nodes
   (let [original-data
         ;; Test a mix of pages and blocks
@@ -887,6 +907,176 @@
            (:pages-and-blocks imported-nodes)))
     (is (= (expand-properties (:properties original-data)) (:properties imported-nodes)))
     (is (= (expand-classes (:classes original-data)) (:classes imported-nodes)))))
+
+(defn- page-child-titles
+  [db page-title]
+  (->> (db-test/find-page-by-title db page-title)
+       ldb/get-children
+       (remove :logseq.property/created-from-property)
+       (mapv :block/title)))
+
+(defn- normalize-reference-title
+  [title]
+  (if (re-find #"^Second " title) "Second" title))
+
+(deftest import-selected-nodes-preserves-sibling-order-with-internal-block-ref
+  ;; A referenced selected sibling keeps its position across EDN export/import.
+  (let [target-uuid (random-uuid)
+        original-data
+        {:pages-and-blocks
+         [{:page {:block/title "Example"}
+           :blocks [{:block/title "First"
+                     :block/uuid target-uuid
+                     :build/keep-uuid? true}
+                    {:block/title (str "Second " (page-ref/->page-ref target-uuid))}
+                    {:block/title "Third"}]}]}
+        conn (db-test/create-conn-with-blocks original-data)
+        node-ids (->> [(db-test/find-block-by-content @conn "First")
+                       (db-test/find-block-by-content @conn #"^Second ")
+                       (db-test/find-block-by-content @conn "Third")]
+                      (mapv #(vector :block/uuid (:block/uuid %))))
+        export (sqlite-export/build-export @conn {:export-type :selected-nodes :node-ids node-ids})
+        exported-blocks (:blocks (first (:pages-and-blocks export)))
+        exported-titles (mapv :block/title exported-blocks)
+        exported-uuids (keep :block/uuid exported-blocks)
+        conn2 (db-test/create-conn-with-import-map export)
+        _ (validate-db @conn2)
+        imported-target (db-test/find-block-by-content @conn2 "First")
+        imported-source (db-test/find-block-by-content @conn2 #"^Second ")]
+    (is (= ["First" "Second" "Third"]
+           (mapv normalize-reference-title exported-titles))
+        "Selected-node export keeps sibling document order")
+    (is (= 1 (count (filter #(= "First" %) exported-titles)))
+        "Referenced selected target is not appended again")
+    (is (= [target-uuid] (vec exported-uuids))
+        "Export keeps the selected target UUID once")
+    (is (= ["First" "Second" "Third"]
+           (mapv normalize-reference-title (page-child-titles @conn2 "Example")))
+        "Imported sibling order matches the selected source")
+    (is (= 1 (count (d/datoms @conn2 :avet :block/title "First")))
+        "Import creates a single target block")
+    (is (= target-uuid (:block/uuid imported-target))
+        "Imported target keeps its UUID")
+    (is (re-find (re-pattern (str target-uuid)) (:block/title imported-source))
+        "Imported block ref still resolves to the target")))
+
+(deftest import-selected-nodes-keeps-referenced-child-under-parent
+  ;; Selecting a parent plus a sibling that refs the parent's child must not
+  ;; promote that child to a page-level block on import.
+  (let [child-uuid (random-uuid)
+        original-data
+        {:pages-and-blocks
+         [{:page {:block/title "Hierarchy"}
+           :blocks [{:block/title "Parent"
+                     :build/children [{:block/title "Child"
+                                       :block/uuid child-uuid
+                                       :build/keep-uuid? true}]}
+                    {:block/title (str "Sibling " (page-ref/->page-ref child-uuid))}]}]}
+        conn (db-test/create-conn-with-blocks original-data)
+        node-ids (->> [(db-test/find-block-by-content @conn "Parent")
+                       (db-test/find-block-by-content @conn #"Sibling")]
+                      (mapv #(vector :block/uuid (:block/uuid %))))
+        export (sqlite-export/build-export @conn {:export-type :selected-nodes :node-ids node-ids})
+        exported-blocks (:blocks (first (:pages-and-blocks export)))
+        conn2 (db-test/create-conn-with-import-map export)
+        imported-parent (db-test/find-block-by-content @conn2 "Parent")
+        imported-child (db-test/find-block-by-content @conn2 "Child")]
+    (validate-db @conn2)
+    (is (= ["Parent" "Sibling"]
+           (->> exported-blocks (mapv :block/title) (mapv #(if (re-find #"Sibling" %) "Sibling" %))))
+        "Export does not append the nested child as a selected root")
+    (is (= [child-uuid]
+           (mapv :block/uuid (mapcat :build/children exported-blocks)))
+        "Child stays nested under the selected parent in the export")
+    (is (= ["Parent" "Sibling"]
+           (->> (page-child-titles @conn2 "Hierarchy")
+                (mapv #(if (re-find #"Sibling" %) "Sibling" %))))
+        "Imported child is not promoted to a page-level sibling")
+    (is (= child-uuid (:block/uuid imported-child)))
+    (is (= (:block/uuid imported-parent)
+           (:block/uuid (:block/parent imported-child)))
+        "Imported child remains under the selected parent")))
+
+(deftest import-block-that-references-its-destination
+  ;; Pasting a block that refs the destination must still replace the
+  ;; destination. build-block-import-options appends that replacement after the
+  ;; destination's shallow content-ref export.
+  (let [dest-uuid (random-uuid)
+        original-data
+        {:pages-and-blocks
+         [{:page {:block/title "page1"}
+           :blocks [{:block/title (str "source " (page-ref/->page-ref dest-uuid))}
+                    {:block/title "destination"
+                     :block/uuid dest-uuid
+                     :build/keep-uuid? true}]}]}
+        conn (db-test/create-conn-with-blocks original-data)
+        imported (export-block-and-import-to-another-block conn conn #"source" "destination")
+        dest (d/entity @conn [:block/uuid dest-uuid])]
+    (is (re-find #"source" (get-in imported [::sqlite-export/block :block/title]))
+        "Re-exported destination has the pasted source title")
+    (is (re-find #"source" (:block/title dest))
+        "Destination block content is replaced")
+    (is (re-find (re-pattern (str dest-uuid)) (:block/title dest))
+        "Pasted source still references the destination UUID")))
+
+(deftest import-selected-nodes-edn-with-duplicate-keep-uuid-target
+  ;; Repeated UUIDs retain their first position when importing EDN directly.
+  (let [target-uuid (random-uuid)
+        export {:pages-and-blocks
+                [{:page {:block/title "Example"}
+                  :blocks [{:block/title "First"
+                            :block/uuid target-uuid
+                            :build/keep-uuid? true}
+                           {:block/title (str "Second " (page-ref/->page-ref target-uuid))}
+                           {:block/title "Third"}
+                           {:block/title "First"
+                            :block/uuid target-uuid
+                            :build/keep-uuid? true}]}]
+                ::sqlite-export/export-type :selected-nodes}
+        conn (db-test/create-conn-with-import-map export)
+        imported-target (db-test/find-block-by-content @conn "First")
+        imported-source (db-test/find-block-by-content @conn #"^Second ")]
+    (validate-db @conn)
+    (is (= ["First" "Second" "Third"]
+           (mapv normalize-reference-title (page-child-titles @conn "Example")))
+        "Import keeps first/document order when the export repeats a keep-uuid target")
+    (is (= 1 (count (d/datoms @conn :avet :block/title "First")))
+        "Duplicate keep-uuid target does not create a second visible target")
+    (is (= target-uuid (:block/uuid imported-target)))
+    (is (re-find (re-pattern (str target-uuid)) (:block/title imported-source))
+        "Imported block ref still resolves to the target")))
+
+(deftest import-duplicate-blocks-preserves-unique-descendants
+  (let [child-uuid (random-uuid)
+        branch-uuid (random-uuid)
+        export {:pages-and-blocks
+                [{:page {:block/title "Example"}
+                  :blocks [{:block/title "Parent"
+                            :build/children
+                            [{:block/title "Child"
+                              :block/uuid child-uuid
+                              :build/keep-uuid? true
+                              :build/children [{:block/title "Branch"
+                                                :block/uuid branch-uuid
+                                                :build/keep-uuid? true}]}]}
+                           {:block/title "Tail"}
+                           {:block/title "Child"
+                            :block/uuid child-uuid
+                            :build/keep-uuid? true
+                            :build/children
+                            [{:block/title "Branch"
+                              :block/uuid branch-uuid
+                              :build/keep-uuid? true
+                              :build/children [{:block/title "Leaf"}]}
+                             {:block/title "Sibling"}]}]}]}
+        conn (db-test/create-conn-with-import-map export)
+        child (db-test/find-block-by-content @conn "Child")
+        branch (db-test/find-block-by-content @conn "Branch")]
+    (is (= ["Parent" "Tail"] (page-child-titles @conn "Example")))
+    (is (= ["Child"]
+           (mapv :block/title (ldb/get-children (db-test/find-block-by-content @conn "Parent")))))
+    (is (= ["Branch" "Sibling"] (mapv :block/title (ldb/get-children child))))
+    (is (= ["Leaf"] (mapv :block/title (ldb/get-children branch))))))
 
 (deftest export-selected-nodes-with-missing-node
   (let [conn (db-test/create-conn-with-blocks
@@ -1447,3 +1637,63 @@
     (is (= [:block/uuid asset2-uuid]
            [:block/uuid (:block/uuid (:logseq.property.pdf/hl-image annotation-image))])
         ":logseq.property.pdf/hl-image should preserve the asset ref")))
+
+(defn- call-validate-local-db
+  [orig-validate db opts]
+  (if (seq opts)
+    (apply orig-validate db (apply concat opts))
+    (orig-validate db)))
+
+(deftest validate-import-txs-tx-scope-validates-only-touched-entities
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "existing-page"}
+                                   :blocks [{:block/title "existing-block"}]}]})
+        existing-page (db-test/find-page-by-title @conn "existing-page")
+        _ (d/transact! conn [{:db/id (:db/id existing-page)
+                              :not-a-real-attr true}])
+        export-map {:pages-and-blocks [{:page {:block/title "imported-page"}
+                                        :blocks [{:block/title "imported-block"}]}]}
+        txs (sqlite-export/build-import export-map @conn {})
+        orig-validate db-validate/validate-local-db!]
+    (testing "tx scope ignores untouched invalid entities and passes entity-ids"
+      (let [tx-calls (atom [])]
+        (with-redefs [db-validate/validate-local-db!
+                      (fn [db & {:as opts}]
+                        (swap! tx-calls conj opts)
+                        (call-validate-local-db orig-validate db opts))]
+          (let [result (sqlite-export/validate-import-txs txs @conn {:validate-scope :tx
+                                                                    :edn-label "tx-scope EDN"})
+                entity-ids (set (:entity-ids (first @tx-calls)))
+                graph-eids (set (map :e (d/datoms @conn :eavt)))]
+            (is (nil? (:error result)))
+            (is (= 1 (count @tx-calls)))
+            (is (seq entity-ids))
+            (is (not (contains? entity-ids (:db/id existing-page))))
+            (is (< (count entity-ids) (count graph-eids)))))))
+    (testing "graph scope still validates the whole db"
+      (let [graph-calls (atom [])]
+        (with-redefs [db-validate/validate-local-db!
+                      (fn [db & {:as opts}]
+                        (swap! graph-calls conj opts)
+                        (call-validate-local-db orig-validate db opts))]
+          (let [result (db-test/silence-stderr
+                        (sqlite-export/validate-import-txs txs @conn {:edn-label "graph-scope EDN"}))]
+            (is (some? (:error result)))
+            (is (re-find #"validation error" (:error result)))
+            (is (= 1 (count @graph-calls)))
+            (is (nil? (:entity-ids (first @graph-calls))))))))))
+
+(deftest validate-import-txs-tx-scope-rejects-invalid-tx
+  (let [conn (db-test/create-conn)
+        txs {:init-tx [{:db/id -1
+                        :block/uuid (random-uuid)
+                        :block/title 123
+                        :block/name "invalid-imported-page"
+                        :block/created-at 1
+                        :block/updated-at 1
+                        :block/tags :logseq.class/Page}]}]
+    (db-test/silence-stderr
+     (let [result (sqlite-export/validate-import-txs txs @conn {:validate-scope :tx
+                                                               :edn-label "invalid tx EDN"})]
+       (is (some? (:error result)))
+       (is (re-find #"validation error" (:error result)))))))

@@ -71,7 +71,9 @@
              "--pos"
              "--content"
              "--path"
+             "--blocks"
              "--blocks-file"
+             "--dry-run"
              "--status"
              "--priority"
              "--scheduled"
@@ -87,6 +89,7 @@
              "--add-properties"
              "--remove-properties"
              "--page"
+             "--rename"
              "--name"
              "--type"
              "--cardinality"
@@ -100,7 +103,8 @@
               "remove property"]
    :options ["--id"
              "--uuid"
-             "--name"]}
+             "--name"
+             "--force"]}
 
   :query
   {:commands ["query"

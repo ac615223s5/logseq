@@ -331,6 +331,16 @@
                      (range (min parallelism (count asset-ops))))))
       (p/resolved nil))))
 
+(defn enqueue-asset-task!
+  [client task]
+  (when-let [queue (:asset-queue client)]
+    (swap! queue
+           (fn [prev]
+             (-> (or prev (p/resolved nil))
+                 ;; Keep queue alive even if one asset task fails.
+                 (p/catch (fn [_] nil))
+                 (p/then (fn [_] (task))))))))
+
 (defn enqueue-asset-sync!
   [repo client {:keys [enqueue-asset-task-f current-client-f broadcast-rtc-state!-f fail-fast-f]}]
   (enqueue-asset-task-f
@@ -350,13 +360,13 @@
 
 (defn download-remote-asset!
   [repo graph-id asset-uuid asset-type]
-  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)
+        asset-id (str asset-uuid)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [aes-key (graph-aes-key
                            repo graph-id
                            (fn [tag data]
                              (throw (ex-info (name tag) data))))
-                  asset-id (str asset-uuid)
                   get-url (sync-large-title/asset-url base graph-id asset-id asset-type)
                   headers (sync-auth/auth-headers (worker-state/get-id-token))
                   request-opts (cond-> {:method "GET"}
@@ -368,20 +378,21 @@
                       (throw (ex-info "download asset failed"
                                       {:type :rtc.exception/download-asset-failed
                                        :data {:status status}})))
+                  ;; In-flight total may be encoded wire size; completion uses decoded size.
                   total (or (parse-content-length resp) 0)
                   _ (notify-asset-progress! repo asset-id :download 0 total)
                   body (.arrayBuffer resp)
                   body-size (.-byteLength body)
-                  total' (if (pos? total) total body-size)
-                  _ (notify-asset-progress! repo asset-id :download body-size total')
                   asset-file
                   (if (not aes-key)
                     body
                     (let [asset-file-untransited (ldb/read-transit-str (.decode (js/TextDecoder.) body))]
-                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))]
-            (<write-asset-bytes! repo asset-id asset-type asset-file))
+                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))
+                  _ (<write-asset-bytes! repo asset-id asset-type asset-file)]
+            (notify-asset-progress! repo asset-id :download body-size body-size))
           (p/catch
            (fn [e]
+             (notify-asset-progress! repo asset-id :download 0 0)
              (if (= :rtc.exception/download-asset-failed (:type (ex-data e)))
                (p/rejected e)
                (p/rejected (ex-info "download asset failed"
@@ -457,7 +468,8 @@
         queue (atom (vec candidates))
         result (atom {:total (count candidates)
                       :downloaded 0
-                      :skipped-existing 0})
+                      :skipped-existing 0
+                      :failed 0})
         pop-queue! (fn []
                      (let [selected (atom nil)]
                        (swap! queue
@@ -471,16 +483,21 @@
         worker (fn worker []
                  (if-let [{:keys [asset-uuid asset-type]} (pop-queue!)]
                    (let [asset-id (str asset-uuid)]
-                     (p/let [meta (platform/asset-stat current-platform
-                                                       repo
-                                                       (asset-file-name asset-id asset-type))
-                             _ (if meta
-                                 (do
-                                   (swap! result update :skipped-existing inc)
-                                   nil)
-                                 (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
-                                   (swap! result update :downloaded inc)))]
-                       (worker)))
+                     (-> (p/let [meta (platform/asset-stat current-platform
+                                                           repo
+                                                           (asset-file-name asset-id asset-type))
+                                 _ (if meta
+                                     (do
+                                       (swap! result update :skipped-existing inc)
+                                       nil)
+                                     (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
+                                       (swap! result update :downloaded inc)))]
+                           nil)
+                         (p/catch (fn [e]
+                                    (swap! result update :failed inc)
+                                    (log-request-asset-download-failed! repo asset-uuid e)
+                                    nil))
+                         (p/then (fn [_] (worker)))))
                    (p/resolved nil)))]
     (p/let [_ (p/all (mapv (fn [_] (worker))
                            (range (min remote-asset-download-parallelism

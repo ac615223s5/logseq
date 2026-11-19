@@ -8,6 +8,8 @@
 #?(:cljs
    (def *thread-apis (volatile! {})))
 
+#?(:cljs (def *profile (volatile! {})))
+
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (defmacro defkeyword [& _args])
 
@@ -21,7 +23,14 @@
            ~qualified-keyword-name
            (fn ~(symbol (str "thread-api--" (name qualified-keyword-name))) ~params ~@body)))
 
-#?(:cljs (def *profile (volatile! {})))
+#?(:cljs (defonce ^:private *worker-thread-api-call-id (atom 0)))
+
+
+#?(:cljs
+   (defn- log-worker-thread-api-call!
+     [data]
+     (when (and goog.DEBUG (> (:total-ms data) 10))
+       (log/info :db-worker/thread-api-handler data))))
 
 #?(:cljs
    (defn- write-transit-str-with-catch
@@ -33,19 +42,105 @@
          (throw e)))))
 
 #?(:cljs
+   (defn- transit-safe-value
+     [v]
+     (cond
+       (or (nil? v) (boolean? v) (string? v) (keyword? v) (number? v)) v
+       (and (map? v) (seq v))
+       (not-empty
+        (into {}
+              (keep (fn [[k val]]
+                      (when-let [safe (transit-safe-value val)]
+                        [k safe])))
+              v))
+       :else nil)))
+
+#?(:cljs
+   (defn- error->transit-safe
+     "Keep transit-safe fields so a rejected worker call cannot take down
+      the process when ex-data contains entities, functions, or other values."
+     [error]
+     (let [message (or (ex-message error)
+                       (when (instance? js/Error error)
+                         (.-message error))
+                       "Unknown error")
+           data (ex-data error)
+           payload (transit-safe-value (:payload data))
+           safe (cond-> {}
+                  (keyword? (:code data)) (assoc :code (:code data))
+                  (keyword? (:type data)) (assoc :type (:type data))
+                  (keyword? (:error data)) (assoc :error (:error data))
+                  (string? (:path data)) (assoc :path (:path data))
+                  (string? (:reason data)) (assoc :reason (:reason data))
+                  (some? (:block data)) (assoc :block (str (:block data)))
+                  (some? (:line data)) (assoc :line (:line data))
+                  (some? (:status data)) (assoc :status (:status data))
+                  (some? payload) (assoc :payload payload))]
+       (ex-info (if (or (nil? message) (= "" message)) "Unknown error" message)
+                safe))))
+
+#?(:cljs
+   (defn- write-error-transit-str
+     [error qualified-kw-str]
+     (try
+       (ldb/write-transit-str (if (instance? js/Error error) error (error->transit-safe error)))
+       (catch :default _
+         (try
+           (ldb/write-transit-str (error->transit-safe error))
+           (catch :default _
+             (log/error :thread-api-write-transit-failed qualified-kw-str)
+             (ldb/write-transit-str (ex-info "Unknown error"
+                                             {:code :thread-api/unserializable-error}))))))))
+
+#?(:cljs
    (defn remote-function
-     "Return a promise whose value is transit-str."
+     "Return a promise whose value is a transit string."
      [qualified-kw-str args-transit-str]
-     (let [qkw (keyword qualified-kw-str)]
+     (let [qkw (keyword qualified-kw-str)
+           call-id (swap! *worker-thread-api-call-id inc)
+           started-at (.now js/performance)]
        (vswap! *profile update qkw inc)
        (if-let [f (@*thread-apis qkw)]
-         (let [result (apply f (ldb/read-transit-str args-transit-str))
-               result-promise
-               (if (fn? result) ;; missionary task is a fn
-                 (js/Promise. result)
-                 result)]
-           (->
-            (p/let [result' result-promise]
-              (write-transit-str-with-catch result' qualified-kw-str))
-            (p/catch (fn [e] (write-transit-str-with-catch e qualified-kw-str)))))
+         (let [args (ldb/read-transit-str args-transit-str)
+               handler-started-at (.now js/performance)]
+           (try
+             (let [result-promise (apply f args)]
+               (->
+                (p/let [result result-promise
+                        handler-completed-at (.now js/performance)
+                        result-transit-str (write-transit-str-with-catch result qualified-kw-str)
+                        completed-at (.now js/performance)]
+                  (log-worker-thread-api-call!
+                   {:worker-call-id call-id
+                    :api qkw
+                    :status :ok
+                    :deserialize-ms (- handler-started-at started-at)
+                    :handler-ms (- handler-completed-at handler-started-at)
+                    :serialize-ms (- completed-at handler-completed-at)
+                    :total-ms (- completed-at started-at)})
+                  result-transit-str)
+                (p/catch
+                 (fn [error]
+                   (let [handler-completed-at (.now js/performance)
+                         error-transit-str (write-error-transit-str error qualified-kw-str)
+                         completed-at (.now js/performance)]
+                     (log-worker-thread-api-call!
+                      {:worker-call-id call-id
+                       :api qkw
+                       :status :error
+                       :deserialize-ms (- handler-started-at started-at)
+                       :handler-ms (- handler-completed-at handler-started-at)
+                       :serialize-ms (- completed-at handler-completed-at)
+                       :total-ms (- completed-at started-at)})
+                     error-transit-str)))))
+             (catch :default error
+               (log-worker-thread-api-call!
+                {:worker-call-id call-id
+                 :api qkw
+                 :status :error
+                 :deserialize-ms (- handler-started-at started-at)
+                 :handler-ms (- (.now js/performance) handler-started-at)
+                 :serialize-ms 0
+                 :total-ms (- (.now js/performance) started-at)})
+               (throw error))))
          (throw (ex-info (str "not found thread-api: " qualified-kw-str) {}))))))

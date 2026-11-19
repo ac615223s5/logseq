@@ -11,7 +11,7 @@
        (rules/extract-rules rules/db-query-dsl-rules)))
 
 (deftest get-full-deps
-  (let [property-value-deps #{:ref->val :class-extends :object-has-class-property :property-missing-value :ref-property-value :ref-property-value-with-default}
+  (let [property-value-deps #{:ref->val :class-extends :class-instance :object-has-class-property :property-missing-value :ref-property-value :ref-property-value-with-default}
         property-deps (conj property-value-deps :ref-property-with-default)
         task-deps (conj property-deps :task)
         priority-deps (conj property-deps :priority)
@@ -264,3 +264,39 @@
                                 @conn)
                   (map (comp :block/title first))
                   set))))))
+
+(deftest task-and-priority-rules
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "Page1"}
+                 :blocks [{:block/title "doing task"
+                           :build/tags [:logseq.class/Task]
+                           :build/properties {:logseq.property/status :logseq.property/status.doing}}
+                          {:block/title "review task"
+                           :build/tags [:logseq.class/Task]
+                           :build/properties {:logseq.property/status :logseq.property/status.in-review}}
+                          {:block/title "waiting task"
+                           :build/tags [:logseq.class/Task]
+                           :build/properties {:logseq.property/status [:build/page {:block/title "QA Ready"}]}}
+                          {:block/title "urgent task"
+                           :build/properties {:logseq.property/priority [:build/page {:block/title "Very High"}]}}]}]})
+        titles (fn [q] (->> (q-with-rules q @conn)
+                            (map (comp :block/title first))))]
+    (testing "task rule accepts capitalized sets from direct callers (e.g. journal queries)"
+      (is (= ["doing task"]
+             (titles '[:find (pull ?b [:block/title]) :where (task ?b #{"Doing"})]))))
+    (testing "task rule accepts lowercase sets produced by the DSL"
+      (is (= ["doing task"]
+             (titles '[:find (pull ?b [:block/title]) :where (task ?b #{"doing"})])))
+      (is (= ["review task"]
+             (titles '[:find (pull ?b [:block/title]) :where (task ?b #{"in review"})]))))
+    (testing "task rule matches custom mixed-case values exactly and lowercased"
+      (is (= ["waiting task"]
+             (titles '[:find (pull ?b [:block/title]) :where (task ?b #{"QA Ready"})])))
+      (is (= ["waiting task"]
+             (titles '[:find (pull ?b [:block/title]) :where (task ?b #{"qa ready"})]))))
+    (testing "priority rule"
+      (is (= ["urgent task"]
+             (titles '[:find (pull ?b [:block/title]) :where (priority ?b #{"Very High"})])))
+      (is (= ["urgent task"]
+             (titles '[:find (pull ?b [:block/title]) :where (priority ?b #{"very high"})]))))))

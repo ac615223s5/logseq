@@ -2,6 +2,7 @@
   "Fns to handle block content e.g. internal ids"
   (:require [clojure.string :as string]
             [datascript.core :as d]
+            [datascript.impl.entity :as de]
             [logseq.common.util :as common-util]
             [logseq.common.util.page-ref :as page-ref]
             [logseq.db.frontend.entity-util :as entity-util]))
@@ -26,13 +27,19 @@
     ")"
     "\\]\\]")))
 
+(defn- replace-literal
+  "Replaces all `match` strings in `s` with `replacement`. Unlike
+  `string/replace`, `$` patterns in `replacement` are kept as is."
+  [s match replacement]
+  (string/replace s (re-pattern (common-util/escape-regex-chars match)) (constantly replacement)))
+
 (defn content-id-ref->page
   "Convert id ref backs to page name using refs."
   [content refs]
   (reduce
    (fn [content ref]
      (if (:block/title ref)
-       (string/replace content (page-ref/->page-ref (:block/uuid ref)) (:block/title ref))
+       (replace-literal content (page-ref/->page-ref (:block/uuid ref)) (:block/title ref))
        content))
    content
    refs))
@@ -68,12 +75,12 @@
          (fn [content ref]
            (if (:block/title ref)
              (let [content' (if (not (string/includes? (:block/title ref) " "))
-                              (string/replace content
-                                              (str "#" (page-ref/->page-ref (:block/uuid ref)))
-                                              (str "#" (:block/title ref)))
+                              (replace-literal content
+                                               (str "#" (page-ref/->page-ref (:block/uuid ref)))
+                                               (str "#" (:block/title ref)))
                               content)]
-               (string/replace content' (page-ref/->page-ref (:block/uuid ref))
-                               (page-ref/->page-ref (:block/title ref))))
+               (replace-literal content' (page-ref/->page-ref (:block/uuid ref))
+                                (page-ref/->page-ref (:block/title ref))))
              content))
          content
          (sort-refs refs))
@@ -81,10 +88,15 @@
 
 (defn get-matched-ids
   [content]
-  (->> (re-seq id-ref-pattern content)
-       (distinct)
-       (map second)
-       (map uuid)))
+  (some->> (re-seq id-ref-pattern content)
+           (distinct)
+           (map second)
+           (filter common-util/uuid-string?)
+           (map uuid)))
+
+(defn title-has-id-ref?
+  [title]
+  (boolean (some->> title (re-find id-ref-pattern))))
 
 (defn- replace-tag-ref
   [content page-name id]
@@ -220,16 +232,26 @@
                  (entity-util/page? ref)))
     [(str block-uuid) title]))
 
+(defn- title-ref-entities
+  "Id refs are self-contained in the title, so their targets can be resolved
+   directly without relying on :block/refs being up to date."
+  [ent]
+  (when (de/entity? ent)
+    (keep #(d/entity (.-db ent) [:block/uuid %])
+          (get-matched-ids (:block/title ent)))))
+
 (defn- block-ref-id->title
   [ent max-depth replace-block-refs?]
-  (loop [frontier (set (:block/refs ent))
+  (loop [frontier (into (set (:block/refs ent))
+                        (title-ref-entities ent))
          seen-ids #{}
          id->title {}
          depth 0]
     (if (or (>= depth max-depth)
             (empty? frontier))
       id->title
-      (let [refs (filter map? frontier)
+      (let [ref-entity? (fn [ref] (or (map? ref) (de/entity? ref)))
+            refs (filter ref-entity? frontier)
             new-refs (remove (fn [ref]
                                (contains? seen-ids (:block/uuid ref)))
                              refs)
@@ -238,8 +260,10 @@
                              (keep #(ref->title-entry replace-block-refs? %))
                              new-refs)
             next-frontier (->> new-refs
-                               (mapcat :block/refs)
-                               (filter map?)
+                               (mapcat (fn [ref]
+                                         (concat (:block/refs ref)
+                                                 (title-ref-entities ref))))
+                               (filter ref-entity?)
                                set)]
         (recur next-frontier seen-ids' id->title' (inc depth))))))
 

@@ -9,6 +9,23 @@
             [logseq.db.sqlite.export :as sqlite-export]
             [logseq.db.test.helper :as db-test]))
 
+(deftest build-journals-with-current-title-format
+  (doseq [formatter [nil "yyyy/MM/dd"]]
+    (let [conn (db-test/create-conn)]
+      (when formatter
+        (d/transact! conn [[:db/add :logseq.class/Journal :logseq.property.journal/title-format formatter]]))
+      (sqlite-build/create-blocks
+       conn
+       [{:page {:block/title "References"
+                :build/properties {:date [:build/page {:build/journal 20240102}]}}}])
+      (let [journal (ldb/get-journal-page-by-day @conn 20240102)
+            expected (if formatter "2024/01/02" "Jan 2nd, 2024")]
+        (is (= expected (:block/title journal)))
+        (is (= (if formatter "2024/01/02" "jan 2nd, 2024") (:block/name journal)))
+        (is (= #uuid "00000001-2024-0102-0000-000000000000" (:block/uuid journal)))
+        (is (= (:db/id journal)
+               (:db/id (:user.property/date (ldb/get-page @conn "References")))))))))
+
 (deftest build-tags
   (let [conn (db-test/create-conn)
         _ (sqlite-build/create-blocks
@@ -199,6 +216,28 @@
 
     (is (= block-uuid (:block/uuid (db-test/find-block-by-content @conn "hi"))))
     (is (contains? (:block/refs block-with-block-ref) (db-test/find-block-by-content @conn "hi")))))
+
+(deftest build-class-page-name-from-title
+  (testing "user tag with a random ident suffix is named from its title"
+    (let [conn (db-test/create-conn-with-blocks
+                {:classes {:user.class/warning-A04sq4Ln {:block/title "warning"}}})
+          tag (d/entity @conn :user.class/warning-A04sq4Ln)]
+      (is (= "warning" (:block/title tag)))
+      (is (= "warning" (:block/name tag))
+          "Tag page :block/name matches the title, not the ident suffix")))
+
+  (testing "graph-human import uses the title for the tag page name"
+    (let [conn (db-test/create-conn-with-import-map
+                {::sqlite-export/export-type :graph-human
+                 :classes {:user.class/cite-X7ab12Cd {:block/title "cite"}}
+                 :pages-and-blocks
+                 [{:page {:block/title "page1"}
+                   :blocks [{:block/title "some text"
+                             :build/tags #{:user.class/cite-X7ab12Cd}}]}]})
+          tag (d/entity @conn :user.class/cite-X7ab12Cd)]
+      (is (= "cite" (:block/title tag)))
+      (is (= "cite" (:block/name tag))
+          "Imported tag page is named from its title, not the ident suffix"))))
 
 (deftest build-class-and-property-pages
   (let [class-uuid (random-uuid)

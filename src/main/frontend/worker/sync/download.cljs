@@ -158,6 +158,23 @@
   [url opts schema]
   (sync-util/fetch-json url opts {:response-schema schema}))
 
+(defn- snapshot-stream-request-url
+  "Request the snapshot from the sync server the client already reached.
+
+  Self-hosted nodes build `:url` from the request they see. Behind TLS, or when
+  `DB_SYNC_BASE_URL` points at another host, that absolute URL is a different
+  origin. The desktop app is a secure context, so the follow-up fetch fails
+  with \"Failed to fetch\" while metadata and key requests to `base` succeed.
+  An external object URL, such as a presigned snapshot, is fetched unchanged."
+  [base graph-id server-url]
+  (let [stream-path (str "/sync/" graph-id "/snapshot/stream")
+        parsed (when (string? server-url)
+                 (try (js/URL. server-url)
+                      (catch :default _ nil)))]
+    (if (and parsed (= stream-path (.-pathname parsed)))
+      (str base stream-path (.-search parsed))
+      (or server-url (str base stream-path)))))
+
 (defonce ^:private *import-state (atom nil))
 (def ^:private snapshot-import-datoms-batch-size 10000)
 
@@ -302,18 +319,31 @@
   [{:keys [e a v]}]
   [:db/add e a v])
 
+(def ^:private snapshot-local-only-attrs
+  #{:block/tx-id})
+
 (defn- import-datoms-batch!
   [conn aes-key graph-e2ee? datoms]
   (p/let [datoms-batch (if graph-e2ee?
                          (sync-crypt/<decrypt-snapshot-datoms-batch aes-key datoms)
                          datoms)
+          datoms-batch (remove #(contains? snapshot-local-only-attrs (:a %))
+                               datoms-batch)
+          block-eids (into #{}
+                           (comp (filter #(= :block/uuid (:a %)))
+                                 (map :e))
+                           datoms-batch)
           schema-tx-data (into [] (comp (filter #(= "db" (namespace (:a %))))
                                         (map datom->tx))
                                datoms-batch)
           regular-tx-data (into [] (comp (remove #(= "db" (namespace (:a %))))
                                          (map datom->tx))
                                 datoms-batch)
-          tx-data (into schema-tx-data regular-tx-data)]
+          tx-id (inc (:max-tx @conn))
+          tx-data (into (into schema-tx-data regular-tx-data)
+                        (map (fn [block-eid]
+                               [:db/add block-eid :block/tx-id tx-id]))
+                        block-eids)]
     (when (seq tx-data)
       (d/transact! conn tx-data {:sync-download-graph? true}))))
 
@@ -442,7 +472,6 @@
   (let [graph-e2ee? (if (nil? graph-e2ee?) true (true? graph-e2ee?))]
     (-> (p/let [close-db-f (require-thread-api-f! :thread-api/db-sync-close-db)
                 unlink-db-f (require-thread-api-f! :thread-api/unsafe-unlink-db)
-                recreate-lock-f (require-thread-api-f! :thread-api/db-sync-recreate-lock)
                 invalidate-search-db-f (require-thread-api-f! :thread-api/db-sync-invalidate-search-db)
                 create-or-open-db-f (require-thread-api-f! :thread-api/create-or-open-db)
                 _ (when-let [state @*import-state]
@@ -451,7 +480,6 @@
                 _ (reset! *import-state nil)
                 _ (when reset? (close-db-f repo))
                 _ (when reset? (unlink-db-f repo))
-                _ (when reset? (recreate-lock-f repo))
                 _ (when reset? (invalidate-search-db-f repo))
                 import-id (str (random-uuid))
                 aes-key (when graph-e2ee?
@@ -527,29 +555,28 @@
     (if (and (seq repo) (seq graph-id) (seq base))
       (let [stage* (atom :init)
             import-id* (atom nil)
+            snapshot-url* (atom nil)
             log-f (fn [payload]
                     (rtc-log-and-state/rtc-log :rtc.log/download payload))]
         (-> (p/let [_ (log-f {:sub-type :download-progress
                               :graph-uuid graph-id
                               :message "Preparing graph snapshot download"})
-                    _ (reset! stage* :fetch-pull)
-                    pull-resp (fetch-json (str base "/sync/" graph-id "/pull")
-                                          {:method "GET"}
-                                          :sync/pull)
-                    remote-tx (:t pull-resp)
-                    _ (when-not (integer? remote-tx)
-                        (throw (ex-info "non-integer remote-tx when downloading graph"
-                                        {:repo repo
-                                         :remote-tx remote-tx})))
                     _ (reset! stage* :fetch-snapshot-download)
                     snapshot-resp (fetch-json (str base "/sync/" graph-id "/snapshot/download")
                                               {:method "GET"}
                                               :sync/snapshot-download)
+                    remote-tx (:t snapshot-resp)
+                    _ (when-not (integer? remote-tx)
+                        (throw (ex-info "non-integer remote-tx when downloading graph"
+                                        {:repo repo
+                                         :remote-tx remote-tx})))
                     _ (when graph-e2ee?
                         (reset! stage* :prepare-e2ee)
                         (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
                     _ (reset! stage* :fetch-snapshot-stream)
-                    resp (js/fetch (:url snapshot-resp)
+                    snapshot-url (snapshot-stream-request-url base graph-id (:url snapshot-resp))
+                    _ (reset! snapshot-url* snapshot-url)
+                    resp (js/fetch snapshot-url
                                    (clj->js (with-auth-headers {:method "GET"})))
                     _ (log-f {:sub-type :download-progress
                               :graph-uuid graph-id
@@ -597,6 +624,7 @@
                                    :graph-id graph-id
                                    :graph-e2ee? graph-e2ee?
                                    :stage @stage*
+                                   :snapshot-url @snapshot-url*
                                    :error error
                                    :error-stack (when (instance? js/Error error)
                                                   (.-stack error))
@@ -607,6 +635,8 @@
                                        :graph-id graph-id
                                        :graph-e2ee? graph-e2ee?
                                        :stage @stage*
+                                       :snapshot-url @snapshot-url*
+                                       :code (:code (ex-data error))
                                        :error-message (or (ex-message error)
                                                            (when (instance? js/Error error)
                                                              (.-message error)))

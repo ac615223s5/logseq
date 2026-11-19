@@ -5,6 +5,7 @@
             [logseq.db.frontend.property :as db-property]
             [logseq.db.test.helper :as db-test]
             [logseq.outliner.core :as outliner-core]
+            [logseq.outliner.page :as outliner-page]
             [logseq.outliner.property :as outliner-property]))
 
 (deftest upsert-property!
@@ -28,7 +29,8 @@
       (testing "and change its type from a ref to a non-ref type"
         (outliner-property/upsert-property! conn :user.property/num {:logseq.property/type :checkbox} {})
         (is (= :checkbox (:logseq.property/type (d/entity @conn :user.property/num))))
-        (is (= nil (:db/valueType (d/entity @conn :user.property/num)))))))
+        (is (= nil (:db/valueType (d/entity @conn :user.property/num))))
+        (is (not (db-property/many? (d/entity @conn :user.property/num)))))))
 
   (testing "Multiple properties that generate the same initial :db/ident"
     (let [conn (db-test/create-conn-with-blocks [])]
@@ -59,6 +61,106 @@
     (let [conn (db-test/create-conn-with-blocks {:properties {:empty-prop {:logseq.property/type :default}}})]
       (outliner-property/upsert-property! conn :user.property/empty-prop {:logseq.property/type :number} {})
       (is (= :number (:logseq.property/type (d/entity @conn :user.property/empty-prop)))))))
+
+(deftest upsert-property-converts-plain-page
+  (let [conn (db-test/create-conn)
+        [_ page-uuid] (outliner-page/create! conn "PlainPage" {})
+        page (d/entity @conn [:block/uuid page-uuid])
+        property (outliner-property/upsert-property!
+                  conn nil {:logseq.property/type :default}
+                  {:property-name "PlainPage"
+                   :properties {:db/id (:db/id page)}})
+        converted (d/entity @conn (:db/id page))]
+    (is (ldb/property? property))
+    (is (= (:db/id page) (:db/id converted)))
+    (is (ldb/property? converted))
+    (is (not (ldb/internal-page? converted)))))
+
+(deftest upsert-property-refuses-namespaced-page
+  (let [conn (db-test/create-conn)
+        [_ bar-uuid] (outliner-page/create! conn "Foo/Bar" {:split-namespace? true})
+        bar (d/entity @conn [:block/uuid bar-uuid])
+        foo (ldb/get-page @conn "foo")
+        convert-error (fn [page property-name]
+                        (try
+                          (outliner-property/upsert-property!
+                           conn nil {:logseq.property/type :default}
+                           {:property-name property-name
+                            :properties {:db/id (:db/id page)}})
+                          nil
+                          (catch :default e e)))]
+    (testing "Namespace child"
+      (let [err (convert-error bar "Bar")
+            bar' (d/entity @conn (:db/id bar))]
+        (is (= :notification (:type (ex-data err))))
+        (is (= :page.convert/page-to-property-namespaced
+               (get-in (ex-data err) [:payload :i18n-key])))
+        (is (ldb/internal-page? bar'))
+        (is (not (ldb/property? bar')))))
+
+    (testing "Namespace root"
+      (let [err (convert-error foo "Foo")
+            foo' (d/entity @conn (:db/id foo))]
+        (is (= :notification (:type (ex-data err))))
+        (is (= :page.convert/page-to-property-namespaced
+               (get-in (ex-data err) [:payload :i18n-key])))
+        (is (ldb/internal-page? foo'))
+        (is (not (ldb/property? foo')))))))
+
+(deftest upsert-property-type-change-to-non-cardinality-type-resets-many
+  (testing "changing an unused many property to checkbox or datetime restores :one"
+    (doseq [property-type [:checkbox :datetime]]
+      (let [conn (db-test/create-conn-with-blocks
+                  {:properties {:note {:logseq.property/type :default}}})]
+        (outliner-property/upsert-property! conn :user.property/note {:db/cardinality :many} {})
+        (outliner-property/upsert-property! conn :user.property/note {:logseq.property/type property-type} {})
+        (is (= property-type (:logseq.property/type (d/entity @conn :user.property/note))))
+        (is (not (db-property/many? (d/entity @conn :user.property/note)))))))
+  (testing "changing an unused many property to another cardinality type keeps :many"
+    (let [conn (db-test/create-conn-with-blocks
+                {:properties {:note {:logseq.property/type :default}}})]
+      (outliner-property/upsert-property! conn :user.property/note {:db/cardinality :many} {})
+      (outliner-property/upsert-property! conn :user.property/note {:logseq.property/type :number} {})
+      (is (= :number (:logseq.property/type (d/entity @conn :user.property/note))))
+      (is (db-property/many? (d/entity @conn :user.property/note))))))
+
+(deftest upsert-property-schema-restore-skips-many-to-one-when-other-fields-present
+  (testing "replaying a schema that includes :one plus type keeps :many when values exist"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "b1" :build/properties {:note "text 1"}}]}])]
+      (outliner-property/upsert-property! conn :user.property/note {:db/cardinality :many} {})
+      (outliner-property/upsert-property! conn :user.property/note
+                                          {:logseq.property/type :default
+                                           :db/cardinality :one}
+                                          {})
+      (is (db-property/many? (d/entity @conn :user.property/note)))
+      (is (set? (:user.property/note (db-test/find-block-by-content @conn "b1")))))))
+
+(deftest upsert-property-omitted-cardinality-keeps-many-with-closed-values
+  (testing "omitting :db/cardinality does not convert many to one when choices exist"
+    (let [conn (db-test/create-conn-with-blocks
+                {:properties {:status {:logseq.property/type :default
+                                       :build/closed-values [{:value "active"}]}}
+                 :pages-and-blocks
+                 [{:page {:block/title "page1"}
+                   :blocks [{:block/title "b1" :build/properties {:status "active"}}]}]})]
+      (outliner-property/upsert-property! conn :user.property/status {:db/cardinality :many} {})
+      (is (db-property/many? (d/entity @conn :user.property/status)))
+      (outliner-property/upsert-property! conn :user.property/status {:logseq.property/type :default} {})
+      (is (db-property/many? (d/entity @conn :user.property/status)))
+      (is (set? (:user.property/status (db-test/find-block-by-content @conn "b1")))))))
+
+(deftest upsert-property-rejects-many-to-one-with-existing-data
+  (testing "Changing many to one is rejected when property has values"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "b1" :build/properties {:note "text 1"}}]}])]
+      (outliner-property/upsert-property! conn :user.property/note {:db/cardinality :many} {})
+      (is (db-property/many? (d/entity @conn :user.property/note)))
+      (is (thrown-with-msg?
+           js/Error #"Disallowed many to one conversion"
+           (outliner-property/upsert-property! conn :user.property/note {:db/cardinality :one} {}))))))
 
 (deftest convert-property-input-string
   (testing "Convert property input string according to its schema type"
@@ -128,7 +230,17 @@
 
       (is (seq new-property-values) "New property values created")
       (is (= #{3 4 5} (set (map db-property/property-value-content new-property-values)))
-          "Property value has correct content"))))
+          "Property value has correct content")))
+
+  (testing "Create a default value for a :number property"
+    (let [conn (db-test/create-conn-with-blocks
+                {:properties {:num {:logseq.property/type :number}}})
+          property-id (:db/id (d/entity @conn :user.property/num))
+          ;; Use same args as outliner.op
+          _ (outliner-property/create-property-text-block! conn property-id :logseq.property/default-value "5" {})
+          default-value (:logseq.property/default-value (d/entity @conn property-id))]
+      (is (= 5 (db-property/property-value-content default-value))
+          "Default value is stored as a number"))))
 
 (deftest set-block-property-basic-cases
   (testing "Set a :number value with existing value"
@@ -139,7 +251,6 @@
           property-value (:user.property/num (db-test/find-block-by-content @conn "b1"))
           _ (assert (:db/id property-value))
           block-uuid (:block/uuid (db-test/find-block-by-content @conn "b2"))
-          ;; Use same args as outliner.op
           _ (outliner-property/set-block-property! conn [:block/uuid block-uuid] :user.property/num (:db/id property-value))]
       (is (= (:db/id property-value)
              (:db/id (:user.property/num (db-test/find-block-by-content @conn "b2")))))
@@ -156,10 +267,90 @@
           property-value (:user.property/num (db-test/find-block-by-content @conn "b1"))
           _ (assert (:db/id property-value))
           block-uuid (:block/uuid (db-test/find-block-by-content @conn "b2"))
-          ;; Use same args as outliner.op
           _ (outliner-property/set-block-property! conn [:block/uuid block-uuid] :user.property/num (:db/id property-value))]
       (is (= (:db/id property-value)
              (:db/id (:user.property/num (db-test/find-block-by-content @conn "b2"))))))))
+
+(deftest set-block-property-skips-identical-many-ref-values
+  (let [conn (db-test/create-conn-with-blocks
+              {:properties {:nodes {:logseq.property/type :node :db/cardinality :db.cardinality/many}}
+               :pages-and-blocks [{:page {:block/title "page1"}
+                                   :blocks [{:block/title "b1"
+                                             :build/properties {:nodes #{[:build/page {:block/title "A"}]
+                                                                         [:build/page {:block/title "B"}]}}}]}]})
+        block-id (:db/id (db-test/find-block-by-content @conn "b1"))
+        value-ids (set (map :db/id (:user.property/nodes (d/entity @conn block-id))))
+        tx-count (atom 0)]
+    (is (= 2 (count value-ids)))
+    (d/listen! conn ::count-txs (fn [_] (swap! tx-count inc)))
+    (outliner-property/set-block-property! conn block-id :user.property/nodes (vec value-ids))
+    (outliner-property/set-block-property! conn block-id :user.property/nodes value-ids)
+    (d/unlisten! conn ::count-txs)
+    (is (zero? @tx-count) "Setting the values a block already has transacts nothing")))
+
+(deftest batch-set-property-stores-explicit-literal-numbers
+  (testing "Literal integers including 0, negatives, and coincidental entity ids store as numbers"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "b1"}
+                           {:block/title "b2"}]}])
+          _ (outliner-property/upsert-property! conn nil {:logseq.property/type :number} {:property-name "rating"})
+          b1-uuid (:block/uuid (db-test/find-block-by-content @conn "b1"))
+          b2-uuid (:block/uuid (db-test/find-block-by-content @conn "b2"))]
+      (outliner-property/batch-set-property! conn [b1-uuid] :user.property/rating 0 {:entity-id? false})
+      (is (= 0 (db-property/property-value-content
+                (:user.property/rating (db-test/find-block-by-content @conn "b1")))))
+
+      (outliner-property/batch-set-property! conn [b1-uuid] :user.property/rating -3 {:entity-id? false})
+      (is (= -3 (db-property/property-value-content
+                 (:user.property/rating (db-test/find-block-by-content @conn "b1")))))
+
+      (outliner-property/batch-set-property! conn [b1-uuid] :user.property/rating 2 {:entity-id? false})
+      (let [value-block-id (:db/id (:user.property/rating (db-test/find-block-by-content @conn "b1")))]
+        (outliner-property/batch-set-property! conn [b2-uuid] :user.property/rating value-block-id {:entity-id? false})
+        (is (= value-block-id
+               (db-property/property-value-content
+                (:user.property/rating (db-test/find-block-by-content @conn "b2"))))
+            "A number that coincides with another value block's entity id is stored as that number")
+        (is (not= value-block-id
+                  (:db/id (:user.property/rating (db-test/find-block-by-content @conn "b2"))))
+            "Does not reuse the other block's value entity")
+        (is (not= 2
+                  (db-property/property-value-content
+                   (:user.property/rating (db-test/find-block-by-content @conn "b2")))))
+        (outliner-property/batch-set-property! conn [b2-uuid] :user.property/rating value-block-id {:entity-id? true})
+        (is (= value-block-id (:db/id (:user.property/rating (db-test/find-block-by-content @conn "b2")))))
+        (is (= 2 (db-property/property-value-content
+                  (:user.property/rating (db-test/find-block-by-content @conn "b2")))))))))
+
+(deftest number-closed-choices-preserve-implicit-entity-ids
+  (let [first-choice (random-uuid)
+        second-choice (random-uuid)
+        conn (db-test/create-conn-with-blocks
+              {:properties {:rating {:logseq.property/type :number
+                                     :build/closed-values [{:uuid first-choice :value 1}
+                                                           {:uuid second-choice :value 2}]}}
+               :pages-and-blocks [{:page {:block/title "page1"}
+                                   :blocks [{:block/title "b1"}]}]})
+        block-id (:db/id (db-test/find-block-by-content @conn "b1"))
+        first-id (:db/id (d/entity @conn [:block/uuid first-choice]))
+        second-id (:db/id (d/entity @conn [:block/uuid second-choice]))]
+    (outliner-property/batch-set-property! conn [block-id] :user.property/rating first-id)
+    (is (= first-id (:db/id (:user.property/rating (d/entity @conn block-id)))))
+    (outliner-property/set-block-property! conn block-id :user.property/rating second-id)
+    (is (= second-id (:db/id (:user.property/rating (d/entity @conn block-id)))))
+    (is (= 2 (db-property/property-value-content (:user.property/rating (d/entity @conn block-id)))))))
+
+(deftest batch-set-many-numbers-preserves-literal-mode
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "b1" :build/properties {:ratings #{2}}}
+                         {:block/title "b2"}]}])
+        value-id (:db/id (first (:user.property/ratings (db-test/find-block-by-content @conn "b1"))))
+        block-id (:db/id (db-test/find-block-by-content @conn "b2"))]
+    (outliner-property/batch-set-property! conn [block-id] :user.property/ratings [0 -3 value-id] {:entity-id? false})
+    (is (= #{0 -3 value-id}
+           (set (map db-property/property-value-content (:user.property/ratings (d/entity @conn block-id))))))))
 
 (deftest set-block-property-with-non-ref-values
   (testing "Setting :default with same property value reuses existing entity"
@@ -297,6 +488,38 @@
     (is (= [:user.class/Project]
            (mapv :db/ident (:block/tags (d/entity @conn [:block/uuid project]))))
         "Doesn't add Task to block when its class provides status")))
+
+(deftest task-child-class-does-not-add-parent-task-tag
+  (let [tag-idents (fn [conn block-uuid]
+                     (set (map :db/ident (:block/tags (d/entity @conn [:block/uuid block-uuid])))))]
+    (doseq [[property-id value]
+            [[:logseq.property/status :logseq.property/status.doing]
+             [:logseq.property/scheduled 1783612800000]
+             [:logseq.property/deadline 1783699200000]]]
+      (testing (str property-id)
+        (let [conn (db-test/create-conn-with-blocks
+                    {:classes {:Work {:build/class-extends [:logseq.class/Task]}}
+                     :pages-and-blocks
+                     [{:page {:block/title "plain page"}}
+                      {:page {:block/title "work page" :build/tags [:Work]}
+                       :blocks [{:block/title "work block" :build/tags [:Work]}]}]})
+              plain-page (:block/uuid (db-test/find-page-by-title @conn "plain page"))
+              work-page (:block/uuid (db-test/find-page-by-title @conn "work page"))
+              work-block (:block/uuid (db-test/find-block-by-content @conn "work block"))]
+          (outliner-property/batch-set-property! conn [plain-page] property-id value)
+          (is (= #{:logseq.class/Task :logseq.class/Page}
+                 (tag-idents conn plain-page))
+              "Adds Task to a plain page with no Task-related class")
+
+          (outliner-property/batch-set-property! conn [work-page] property-id value)
+          (is (= #{:user.class/Work :logseq.class/Page}
+                 (tag-idents conn work-page))
+              "Does not add parent Task to a page tagged with a Task child class")
+
+          (outliner-property/batch-set-property! conn [work-block] property-id value)
+          (is (= #{:user.class/Work}
+                 (tag-idents conn work-block))
+              "Does not add parent Task to a block tagged with a Task child class"))))))
 
 (deftest batch-set-property-rejects-private-built-in-entity
   (let [conn (db-test/create-conn)
@@ -692,3 +915,25 @@
     (is (= [:logseq.class/Root]
            (:logseq.property.class/extends (db-test/readable-properties (d/entity @conn :user.class/C3))))
         "Extends property is restored back to Root")))
+
+(deftest extends-ignores-root-parent-addition
+  (let [conn (db-test/create-conn-with-blocks
+              {:classes {:Parent {}
+                         :Child {}}})
+        child-id (:db/id (d/entity @conn :user.class/Child))
+        parent-id (:db/id (d/entity @conn :user.class/Parent))
+        root-id (:db/id (d/entity @conn :logseq.class/Root))
+        extends-idents (fn []
+                         (:logseq.property.class/extends
+                          (db-test/readable-properties (d/entity @conn :user.class/Child))))]
+    (testing "A class with no other parent still extends Root internally"
+      (is (= [:logseq.class/Root] (extends-idents))))
+
+    (testing "Setting Extends to another class retracts Root"
+      (outliner-property/batch-set-property! conn [child-id] :logseq.property.class/extends parent-id)
+      (is (= [:user.class/Parent] (extends-idents))))
+
+    (testing "Adding Root to a class with another parent is ignored"
+      (outliner-property/batch-set-property! conn [child-id] :logseq.property.class/extends root-id)
+      (is (= [:user.class/Parent] (extends-idents))
+          "Root Tag is not added alongside another parent"))))

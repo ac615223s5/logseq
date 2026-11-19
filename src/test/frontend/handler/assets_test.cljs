@@ -1,8 +1,9 @@
 (ns frontend.handler.assets-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require [cljs.test :refer [async deftest is testing]]
             [frontend.config :as config]
             [frontend.fs :as fs]
             [frontend.handler.assets :as assets]
+            [frontend.state :as state]
             [frontend.util :as util]
             [promesa.core :as p]))
 
@@ -101,6 +102,47 @@
     (is (= "assets:///C/logseq__colon/Users/charlie/graph/assets/test.png"
            (assets/normalize-asset-resource-url "C:/Users/charlie/graph/assets/test.png")))))
 
+(deftest file-path->assets-url-does-not-double-encode-percent-spaces-test
+  (with-redefs [util/electron? (constantly true)
+                config/get-repo-dir (constantly "/workspace/graph")]
+    (let [expected "assets:///workspace/shared/logseq-qa/fixtures/path%20spaces/qa%20image.png"]
+      (testing "percent-encoded absolute path encodes %20 once"
+        (is (= expected
+               (assets/file-path->assets-url
+                "/workspace/shared/logseq-qa/fixtures/path%20spaces/qa%20image.png"))))
+      (testing "literal-space absolute path encodes %20 once"
+        (is (= expected
+               (assets/file-path->assets-url
+                "/workspace/shared/logseq-qa/fixtures/path spaces/qa image.png"))))
+      (testing "percent-encoded file URL encodes %20 once"
+        (is (= expected
+               (assets/file-path->assets-url
+                "file:///workspace/shared/logseq-qa/fixtures/path%20spaces/qa%20image.png"))))
+      (testing "literal-space file URL encodes %20 once"
+        (is (= expected
+               (assets/file-path->assets-url
+                "file:///workspace/shared/logseq-qa/fixtures/path spaces/qa image.png"))))
+      (testing "already-encoded assets URL is not encoded again"
+        (is (= expected
+               (assets/file-path->assets-url expected))))
+      (testing "literal % that is not a valid escape stays literal"
+        (is (= "assets:///workspace/shared/logseq-qa/fixtures/50%25ba%25zz.png"
+               (assets/file-path->assets-url
+                "/workspace/shared/logseq-qa/fixtures/50%ba%zz.png"))))
+      (testing "file URL keeps a literal %20 filename"
+        (is (= "assets:///tmp/a%2520b.png"
+               (assets/file-path->assets-url "file:///tmp/a%2520b.png"))))
+      (testing "an undecodable filename does not block escapes in other segments"
+        (is (= "assets:///tmp/my%20photos/50%25ba.png"
+               (assets/file-path->assets-url "/tmp/my%20photos/50%ba.png"))))
+      (testing "file URL with an encoded Windows drive colon resolves to a drive path"
+        (is (= "assets:///C/logseq__colon/Users/a%20b.png"
+               (assets/file-path->assets-url "file:///C%3A/Users/a%20b.png"))))
+      (testing "literal % in the repo dir is not decoded"
+        (with-redefs [config/get-repo-dir (constantly "/workspace/graph%20dir")]
+          (is (= "assets:///workspace/graph%2520dir/a.png"
+                 (assets/file-path->assets-url "a.png"))))))))
+
 (deftest make-asset-url-electron-test
   (async done
     (with-redefs [util/electron? (constantly true)
@@ -131,3 +173,26 @@
     (let [url "assets:///C/logseq__colon/Users/charlie/graph/assets/test.mp3"]
       (is (= url
              (assets/asset-protocol-url->media-url url))))))
+
+(deftest local-file-iframe-src->assets-url-test
+  (with-redefs [state/get-current-repo (constantly "example")
+                config/get-repo-dir (constantly "C:/graph")]
+    (doseq [[src expected]
+            [["file:///C:/docs/example.html?mode=dark#section"
+              "assets:///C/logseq__colon/docs/example.html?mode=dark#section"]
+             ["FILE:///tmp/a%23b%3Fc.html" "assets:///tmp/a%23b%3Fc.html"]
+             ["file:///tmp/a&b.html" "assets:///tmp/a%26b.html"]
+             ["file:///tmp/a%2523b.html" "assets:///tmp/a%2523b.html"]
+             ["file://server/share/example.html" "assets://server/share/example.html"]
+             ["../assets/100%20done%.html?mode=dark#section"
+              "assets:///C/logseq__colon/graph/assets/100%20done%25.html?mode=dark#section"]
+             ["assets/%FF.html" "assets:///C/logseq__colon/graph/assets/%25FF.html"]
+             ["./assets/example.html" "assets:///C/logseq__colon/graph/assets/example.html"]
+             ["https://example.com/example.html" nil]
+             ["//example.com/example.html" nil]
+             ["javascript:alert(1)" nil]
+             ["assets:///tmp/example.html" nil]
+             ["assets-other/example.html" nil]
+             ["file://[invalid" nil]]]
+      (testing src
+        (is (= expected (assets/local-file-iframe-src->assets-url src)))))))

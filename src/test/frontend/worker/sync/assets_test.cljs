@@ -5,10 +5,102 @@
             [frontend.worker.platform :as platform]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.assets :as sync-assets]
+            [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.presence :as sync-presence]
             [logseq.db :as ldb]
             [logseq.db.frontend.schema :as db-schema]
             [promesa.core :as p]))
+
+(defn- mock-headers
+  [header-map]
+  (let [headers (js/Headers.)]
+    (doseq [[k v] header-map]
+      (when (some? v)
+        (.set headers k (str v))))
+    headers))
+
+(defn- mock-ok-download-response
+  [{:keys [content-length content-encoding decoded-size]}]
+  (let [body (js/ArrayBuffer. decoded-size)]
+    #js {:ok true
+         :status 200
+         :headers (mock-headers (cond-> {}
+                                  (some? content-length) (assoc "content-length" content-length)
+                                  (some? content-encoding) (assoc "content-encoding" content-encoding)))
+         :arrayBuffer (fn [] (p/resolved body))}))
+
+(defn- asset-progress-events
+  [broadcasts asset-id]
+  (keep (fn [[event payload]]
+          (when (and (= :rtc-asset-upload-download-progress event)
+                     (= asset-id (:asset-id payload)))
+            (:progress payload)))
+        broadcasts))
+
+(defn- latest-asset-progress
+  [broadcasts asset-id]
+  (last (asset-progress-events broadcasts asset-id)))
+
+(defn- transfer-active?
+  "Same active-transfer rule as frontend.components.rtc.indicator/asset-transfer-counts."
+  [{:keys [direction loaded total]}]
+  (and (contains? #{:upload :download} direction)
+       (number? loaded)
+       (number? total)
+       (not= loaded total)))
+
+(defn- download-remote-asset-progress!
+  [{:keys [content-length content-encoding decoded-size write-error]}]
+  (let [repo "asset-download-progress-repo"
+        graph-id "graph-1"
+        asset-uuid (random-uuid)
+        asset-id (str asset-uuid)
+        broadcasts (atom [])
+        writes (atom [])
+        original-fetch js/fetch
+        db-sync-config @worker-state/*db-sync-config
+        result (fn [ok error]
+                 {:ok ok
+                  :error error
+                  :asset-id asset-id
+                  :progress (latest-asset-progress @broadcasts asset-id)
+                  :progress-events (vec (asset-progress-events @broadcasts asset-id))
+                  :writes @writes})]
+    (reset! worker-state/*db-sync-config
+            {:http-base "https://sync.example.test"})
+    (set! js/fetch
+          (fn [_url _opts]
+            (p/resolved (mock-ok-download-response
+                         {:content-length content-length
+                          :content-encoding content-encoding
+                          :decoded-size decoded-size}))))
+    (-> (p/with-redefs [sync-assets/graph-aes-key
+                        (fn [_repo _graph-id _fail-fast-f]
+                          (p/resolved nil))
+                        platform/current
+                        (fn [] {})
+                        platform/asset-write-bytes!
+                        (fn [_platform repo' file-name payload]
+                          (if write-error
+                            (p/rejected write-error)
+                            (do
+                              (swap! writes conj {:repo repo'
+                                                  :file-name file-name
+                                                  :byte-length (.-byteLength payload)})
+                              (p/resolved nil))))
+                        shared-service/broadcast-to-clients!
+                        (fn [event payload]
+                          (swap! broadcasts conj [event payload]))]
+          (sync-assets/download-remote-asset!
+           repo graph-id asset-uuid "png"))
+        (p/then (fn [_] (result true nil)))
+        (p/catch (fn [error] (result false error)))
+        (p/finally
+          (fn []
+            (set! js/fetch original-fetch)
+            (reset! worker-state/*db-sync-config db-sync-config))))))
 
 (defn- asset-conn
   [asset-uuid]
@@ -130,6 +222,49 @@
                (p/catch (fn [error]
                           (is (= download-error error))
                           (is (= [[repo asset-uuid download-error]] @log-calls))))
+               (p/finally done)))))
+
+(deftest request-asset-download-failure-does-not-block-later-downloads-test
+  (async done
+         (let [repo "asset-download-repo"
+               graph-id "graph-1"
+               missing-uuid (random-uuid)
+               ok-uuid (random-uuid)
+               conn (asset-conn missing-uuid)
+               _ (ldb/transact! conn [{:block/uuid ok-uuid
+                                       :logseq.property.asset/type "png"
+                                       :logseq.property.asset/remote-metadata {:type "png"}}])
+               client {:repo repo
+                       :graph-id graph-id
+                       :asset-queue (atom (p/resolved nil))}
+               download-calls (atom [])]
+           (-> (p/with-redefs [worker-state/*db-sync-client (atom client)
+                               worker-state/get-datascript-conn (fn [_repo] conn)
+                               platform/current (fn [] {})
+                               platform/asset-stat (fn [& _args] (p/resolved nil))
+                               client-op/remove-asset-op (fn [& _args] nil)
+                               shared-service/broadcast-to-clients! (fn [& _args] nil)
+                               sync-presence/rtc-state-payload (fn [& _args] {})
+                               sync-assets/log-request-asset-download-failed! (fn [& _args] nil)
+                               sync-assets/download-remote-asset!
+                               (fn [_repo _graph-id asset-uuid _asset-type]
+                                 (swap! download-calls conj asset-uuid)
+                                 (if (= missing-uuid asset-uuid)
+                                   (p/rejected (ex-info "download asset failed"
+                                                        {:type :rtc.exception/download-asset-failed
+                                                         :data {:status 404}}))
+                                   (p/resolved nil)))]
+                 (p/let [first-result (-> (db-sync/request-asset-download! repo missing-uuid)
+                                          (p/then (fn [_] {:error nil}))
+                                          (p/catch (fn [e] {:error e})))
+                         _ (-> (db-sync/request-asset-download! repo ok-uuid)
+                               (p/catch (fn [_] nil)))]
+                   (is (= 404 (-> first-result :error ex-data :data :status))
+                       "the failing download must still reject for its own caller")
+                   (is (= [missing-uuid ok-uuid] @download-calls)
+                       "a 404 on one asset must not stop later queued downloads")))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
                (p/finally done)))))
 
 (deftest upload-remote-asset-serializes-resolved-encrypted-payload-test
@@ -288,7 +423,8 @@
                (p/then (fn [result]
                          (is (= {:total 2
                                  :downloaded 1
-                                 :skipped-existing 1}
+                                 :skipped-existing 1
+                                 :failed 0}
                                 result))
                          (is (= #{[repo (str existing-uuid ".pdf")]
                                   [repo (str missing-uuid ".png")]}
@@ -298,6 +434,159 @@
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
+
+(deftest download-remote-assets-if-missing-continues-past-failures-test
+  (async done
+         (let [repo "asset-prefetch-repo"
+               graph-id "graph-1"
+               failed-uuid (random-uuid)
+               ok-uuid (random-uuid)
+               candidates [{:asset-uuid failed-uuid
+                            :asset-type "png"}
+                           {:asset-uuid ok-uuid
+                            :asset-type "png"}]
+               download-calls (atom [])
+               log-calls (atom [])]
+           (-> (p/with-redefs [platform/current (fn [] {})
+                               platform/asset-stat
+                               (fn [& _args]
+                                 (p/resolved nil))
+                               sync-assets/log-request-asset-download-failed!
+                               (fn [repo' asset-uuid' error']
+                                 (swap! log-calls conj [repo' asset-uuid' error']))
+                               sync-assets/download-remote-asset!
+                               (fn [_repo _graph-id asset-uuid _asset-type]
+                                 (swap! download-calls conj asset-uuid)
+                                 (if (= failed-uuid asset-uuid)
+                                   (p/rejected (ex-info "download asset failed"
+                                                        {:type :rtc.exception/download-asset-failed
+                                                         :data {:status 404}}))
+                                   (p/resolved nil)))]
+                 (sync-assets/download-remote-assets-if-missing!
+                  repo graph-id candidates))
+               (p/then (fn [result]
+                         (is (= #{failed-uuid ok-uuid} (set @download-calls))
+                             "a failed download must not stop the remaining assets")
+                         (is (= {:total 2
+                                 :downloaded 1
+                                 :skipped-existing 0
+                                 :failed 1}
+                                result))
+                         (is (= 1 (count @log-calls)))
+                         (is (= repo (first (first @log-calls))))
+                         (is (= failed-uuid (second (first @log-calls))))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
+(deftest download-remote-asset-clears-progress-when-content-length-is-compressed-size-test
+  (async done
+         (-> (p/let [gzip (download-remote-asset-progress!
+                           {:content-length 38
+                            :content-encoding "gzip"
+                            :decoded-size 3240})
+                     deflate (download-remote-asset-progress!
+                              {:content-length 38
+                               :content-encoding "deflate"
+                               :decoded-size 3240})]
+               (doseq [{:keys [ok progress progress-events writes]} [gzip deflate]]
+                 (is (true? ok))
+                 (is (= [{:direction :download :loaded 0 :total 38}
+                         {:direction :download :loaded 3240 :total 3240}]
+                        progress-events))
+                 (is (true? (transfer-active? (first progress-events))))
+                 (is (= {:direction :download :loaded 3240 :total 3240} progress))
+                 (is (false? (transfer-active? progress)))
+                 (is (= 1 (count writes)))
+                 (is (= 3240 (:byte-length (first writes))))))
+             (p/catch (fn [error]
+                        (is false (str "unexpected error: " error))))
+             (p/finally done))))
+
+(deftest download-remote-asset-keeps-compressed-download-active-until-body-arrives-test
+  (async done
+         (let [body-p (p/deferred)
+               started (p/deferred)
+               started? (atom false)
+               original-fetch js/fetch
+               db-sync-config @worker-state/*db-sync-config
+               repo "asset-download-progress-repo"
+               graph-id "graph-1"
+               asset-uuid (random-uuid)
+               asset-id (str asset-uuid)
+               broadcasts (atom [])]
+           (reset! worker-state/*db-sync-config
+                   {:http-base "https://sync.example.test"})
+           (set! js/fetch
+                 (fn [_url _opts]
+                   (p/resolved (doto (mock-ok-download-response
+                                      {:content-length 38
+                                       :content-encoding "gzip"
+                                       :decoded-size 3240})
+                                 (aset "arrayBuffer" (fn [] body-p))))))
+           (-> (p/with-redefs [sync-assets/graph-aes-key
+                               (fn [_repo _graph-id _fail-fast-f]
+                                 (p/resolved nil))
+                               platform/current
+                               (fn [] {})
+                               platform/asset-write-bytes!
+                               (fn [_platform _repo _file-name _payload]
+                                 (p/resolved nil))
+                               shared-service/broadcast-to-clients!
+                               (fn [event payload]
+                                 (swap! broadcasts conj [event payload])
+                                 (when (and (= :rtc-asset-upload-download-progress event)
+                                            (compare-and-set! started? false true))
+                                   (p/resolve! started true)))]
+                 (let [download-p (sync-assets/download-remote-asset!
+                                   repo graph-id asset-uuid "png")]
+                   (p/let [_ started
+                           in-flight (latest-asset-progress @broadcasts asset-id)
+                           _ (p/resolve! body-p (js/ArrayBuffer. 3240))
+                           _ download-p]
+                     {:in-flight in-flight
+                      :progress (latest-asset-progress @broadcasts asset-id)})))
+               (p/then (fn [{:keys [in-flight progress]}]
+                         (is (= {:direction :download :loaded 0 :total 38} in-flight))
+                         (is (true? (transfer-active? in-flight)))
+                         (is (= {:direction :download :loaded 3240 :total 3240} progress))
+                         (is (false? (transfer-active? progress)))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally
+                 (fn []
+                   (set! js/fetch original-fetch)
+                   (reset! worker-state/*db-sync-config db-sync-config)
+                   (done)))))))
+
+(deftest download-remote-asset-clears-progress-for-uncompressed-and-missing-content-length-test
+  (async done
+         (-> (p/let [identity-encoding (download-remote-asset-progress!
+                                        {:content-length 3240
+                                         :decoded-size 3240})
+                     no-length (download-remote-asset-progress!
+                                {:decoded-size 3240})]
+               (doseq [{:keys [ok progress]} [identity-encoding no-length]]
+                 (is (true? ok))
+                 (is (= {:direction :download :loaded 3240 :total 3240} progress))
+                 (is (false? (transfer-active? progress)))))
+             (p/catch (fn [error]
+                        (is false (str "unexpected error: " error))))
+             (p/finally done))))
+
+(deftest download-remote-asset-clears-progress-when-write-fails-test
+  (async done
+         (-> (download-remote-asset-progress!
+              {:content-length 3240
+               :decoded-size 3240
+               :write-error (js/Error. "EACCES")})
+             (p/then (fn [{:keys [ok progress]}]
+                       (is (false? ok))
+                       (is (= {:direction :download :loaded 0 :total 0} progress))
+                       (is (false? (transfer-active? progress)))))
+             (p/catch (fn [error]
+                        (is false (str "unexpected error: " error))))
+             (p/finally done))))
 
 (deftest download-remote-assets-if-missing-bounds-download-concurrency-test
   (async done
@@ -327,7 +616,8 @@
                (p/then (fn [result]
                          (is (= {:total 12
                                  :downloaded 12
-                                 :skipped-existing 0}
+                                 :skipped-existing 0
+                                 :failed 0}
                                 result))
                          (is (= 12 (count @download-calls)))
                          (is (= 10 @max-active-downloads))))

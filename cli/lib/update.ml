@@ -11,7 +11,7 @@ type opts = {
   update_properties_edn : string option;
   remove_tags_edn : string option;
   remove_properties_edn : string option;
-  blocks_edn : string option;
+  blocks_markdown : string option;
   blocks_file : Cli_primitive.path option;
 }
 
@@ -99,7 +99,7 @@ let invalid_options (opts : opts) =
           else if (not has_target) && not has_updates then
             Some "target or update/remove options are required"
           else if
-            Option.is_some opts.blocks_edn || Option.is_some opts.blocks_file
+            Option.is_some opts.blocks_markdown || Option.is_some opts.blocks_file
           then Some "--blocks and --blocks-file are only for create mode"
           else None)
 
@@ -710,7 +710,10 @@ let resolve_update_ops invoke_config repo action block_uuids =
 let apply_outliner_ops invoke_config repo ops =
   Transport.thread_api_apply_outliner_ops invoke_config ~repo
     ~ops:(Edn_util.vector_t_vec ops)
-    ~options:(Edn_util.map_t_vec Vec.empty)
+    ~options:(Edn_util.map_t_vec
+      (if Vec.length ops > 1 then
+         Vec.singleton (kw "outliner-op", kw "apply-outliner-ops")
+       else Vec.empty))
 
 let save_ops source_uuid = function
   | Some content ->
@@ -718,7 +721,7 @@ let save_ops source_uuid = function
         (Edn_util.vector_vec
            (Vec.of_array
               [|
-                kw "save-block";
+                kw "logseq.outliner/save-block-input";
                 Edn_util.vector_vec
                   (Vec.of_array
                      [|
@@ -774,13 +777,21 @@ let execute_ops mode invoke_config action source_uuid target_uuid =
                     (Edn_util.map_vec
                        (Vec.of_array [| (kw "result", Edn_util.nil) |]))))
           else
-            bind (apply_outliner_ops invoke_config action.repo ops)
-              (fun result ->
-                pure
-                  (Cli_result.ok ~command:Command_id.Upsert_block mode
-                     (Raw
-                        (Edn_util.map_vec
-                           (Vec.of_array [| (kw "result", result) |]))))))
+            catch
+              (bind (apply_outliner_ops invoke_config action.repo ops)
+                 (fun result ->
+                   pure
+                     (Cli_result.ok ~command:Command_id.Upsert_block mode
+                        (Raw
+                           (Edn_util.map_vec
+                              (Vec.of_array [| (kw "result", result) |]))))))
+              (function
+                | Failure message when message = "Block source does not exist"
+                  ->
+                    pure
+                      (Cli_result.error ~command:Command_id.Upsert_block mode
+                         (Error.make Error.Source_not_found message))
+                | exn -> error exn))
 
 let resolve_optional_target_uuid invoke_config action =
   let open Cli_effect in

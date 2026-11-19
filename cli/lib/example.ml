@@ -36,8 +36,8 @@ let default_entries =
       entry [| "graph"; "export" |]
         [|
           "logseq graph export --graph my-graph --type edn --file \
-           /tmp/my-graph.edn --edn-options '{:export-type :graph \
-           :include-timestamps? true}' --pretty-print";
+           /tmp/my-graph.edn --edn-options '{:export-type :graph-human \
+           :graph-options {:include-timestamps? true}}' --pretty-print";
           "logseq graph export --graph my-graph --type sqlite --file \
            /tmp/my-graph.sqlite";
         |];
@@ -111,11 +111,16 @@ let default_entries =
           "logseq upsert block --graph my-graph --target-page Meeting Notes \
            --content \"AI summary of the discussion\" --update-tags \
            '[\"AI-GENERATED\"]'";
-          "logseq upsert block --graph my-graph --blocks '[{:block/title \
-           \"A\"} {:block/title \"B\"}]'";
+          "logseq upsert block --graph my-graph --target-page Home --blocks \
+           '- Parent'";
+          "logseq upsert block --graph my-graph --target-page Home \
+           --blocks-file ./blocks.md --dry-run";
         |];
       entry [| "upsert"; "page" |]
         [|
+          "logseq upsert page --graph my-graph --page Home --rename \"New \
+           Home\"";
+          "logseq upsert page --graph my-graph --id 999 --rename \"New Home\"";
           "logseq upsert page --graph my-graph --page Home --update-tags \
            '[\"project\"]'";
           "logseq upsert page --graph my-graph --id 999 --update-properties \
@@ -178,6 +183,22 @@ let default_entries =
            '[:logseq.property/status.done \"daily\"]'";
           "logseq query --graph my-graph --query '[:find [?e ...] :where [?e \
            :block/name]]'";
+          "logseq query --graph my-graph --query '[:find ?day :in $ ?start \
+           ?end :where [?p :block/journal-day ?day] [(<= ?start ?day)] [(<= \
+           ?day ?end)]]' --inputs '[:-7d :today]' # Journal days from seven \
+           days ago through today.";
+          "logseq query --graph my-graph --query '[:find [?title ...] :in $ \
+           ?start ?end :where [?b :block/page ?page] [?b :block/title ?title] \
+           [?b :block/updated-at ?updated] [(<= ?start ?updated)] [(<= \
+           ?updated ?end)]]' --inputs '[:today-start :today-end]' # Blocks \
+           updated today; boundaries resolve to epoch milliseconds.";
+          "logseq query --graph my-graph --query '[:find ?title . :in $ ?name \
+           :where [?p :block/name ?name] [?p :block/title ?title]]' --inputs \
+           '[\"[[Home]]\"]' # [[Home]] resolves to \"home\"; CLI has no \
+           current-page or query-block context.";
+          "logseq query --graph my-graph --query '[:find ?value . :in $ ?value \
+           :where [(identity ?value) ?bound]]' --inputs '[\"\\\"42\\\"\"]' # \
+           Keep \"42\" as a string; [\"42\"] resolves to the number 42.";
         |];
       entry [| "query"; "list" |]
         [|

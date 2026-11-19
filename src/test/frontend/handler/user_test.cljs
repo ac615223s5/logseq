@@ -2,6 +2,7 @@
   (:require [cljs.core.async :as a]
             [cljs.test :refer [async deftest is testing]]
             [electron.ipc :as ipc]
+            [frontend.config :as config]
             [frontend.handler.user :as user-handler]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -44,8 +45,8 @@
 
 (deftest set-tokens-persists-auth-json-with-latest-token-values-test
   (let [writes* (atom [])
-        old-state @state/state]
-    (reset! state/state (assoc-in old-state [:system/info :home-dir] "/tmp/home"))
+        old-state (state/get-state)]
+    (state/replace-state! (assoc-in old-state [:system/info :home-dir] "/tmp/home"))
     (try
       (with-mocked-local-storage
         (fn []
@@ -64,14 +65,14 @@
                    (select-keys (js->clj (js/JSON.parse (:content (first @writes*))) :keywordize-keys true)
                                 [:id-token :access-token :refresh-token]))))))
       (finally
-        (reset! state/state old-state)))))
+        (state/replace-state! old-state)))))
 
 (deftest set-tokens-without-refresh-token-persists-existing-refresh-token-test
   (let [writes* (atom [])
-        old-state @state/state]
-    (reset! state/state (-> old-state
-                            (assoc :auth/refresh-token "refresh-token-existing")
-                            (assoc-in [:system/info :home-dir] "/tmp/home")))
+        old-state (state/get-state)]
+    (state/replace-state! (-> old-state
+                              (assoc :auth/refresh-token "refresh-token-existing")
+                              (assoc-in [:system/info :home-dir] "/tmp/home")))
     (try
       (with-mocked-local-storage
         (fn []
@@ -90,21 +91,21 @@
                    (select-keys (js->clj (js/JSON.parse (:content (first @writes*))) :keywordize-keys true)
                                 [:id-token :access-token :refresh-token]))))))
       (finally
-        (reset! state/state old-state)))))
+        (state/replace-state! old-state)))))
 
 (deftest restore-tokens-preserves-refresh-token-before-refreshing-expired-id-token-test
   (async done
-    (let [old-state @state/state
+    (let [old-state (state/get-state)
           old-refresh user-handler/<refresh-id-token&access-token
           old-pub-event! state/pub-event!
           refresh-called (a/chan)
           expired-id-token (jwt {:exp 0})
           refresh-token "refresh-token-from-local-storage"
           restore! (fn []
-                     (reset! state/state old-state)
+                     (state/replace-state! old-state)
                      (set! user-handler/<refresh-id-token&access-token old-refresh)
                      (set! state/pub-event! old-pub-event!))]
-      (reset! state/state (assoc old-state
+      (state/replace-state! (assoc old-state
                                  :auth/id-token nil
                                  :auth/access-token nil
                                  :auth/refresh-token nil))
@@ -134,7 +135,8 @@
 (deftest logout-clears-e2ee-password-when-db-worker-ready-test
   (testing "logout should request db-worker to clear persisted e2ee password"
     (let [ops* (atom [])
-          old-worker @state/*db-worker]
+          old-worker @state/*db-worker
+          old-login-user (:auth/current-login-user (state/get-state))]
       (reset! state/*db-worker :worker)
       (try
         (with-mocked-local-storage
@@ -146,14 +148,25 @@
                           state/pub-event! (fn [& _] nil)
                           user-handler/clear-tokens (fn [] nil)]
               (user-handler/logout)
-              (is (= [:thread-api/clear-e2ee-password] @ops*)))))
+              (is (= :thread-api/clear-e2ee-password
+                     (first @ops*))))))
         (finally
+          (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))
+
+(deftest can-list-remote-graphs-uses-default-server-test
+  (with-redefs [config/dev? false
+                config/get-custom-sync-server-url (constantly nil)
+                state/user-groups (constantly #{})
+                user-handler/logged-in? (constantly true)]
+    (is (false? (user-handler/rtc-group?)))
+    (is (true? (user-handler/can-list-remote-graphs?)))))
 
 (deftest logout-skips-e2ee-password-clear-when-db-worker-missing-test
   (testing "logout should not call db-worker API when db-worker is unavailable"
     (let [invoke-calls* (atom 0)
-          old-worker @state/*db-worker]
+          old-worker @state/*db-worker
+          old-login-user (:auth/current-login-user (state/get-state))]
       (reset! state/*db-worker nil)
       (try
         (with-mocked-local-storage
@@ -167,4 +180,5 @@
               (user-handler/logout)
               (is (zero? @invoke-calls*)))))
         (finally
+          (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))

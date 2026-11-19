@@ -12,7 +12,6 @@
                      [cljs-bean.core :as bean]
                      [cljs-time.core :as t]
                      [clojure.pprint]
-                     [datascript.impl.entity :as de]
                      [dommy.core :as d]
                      [frontend.loader :refer [load]]
                      [frontend.mobile.util :as mobile-util]
@@ -100,8 +99,6 @@
                (gdom/getElementByClass "sidebar-item-list")
                (app-scroll-container-node))))))
 #?(:cljs (defonce el-visible-in-viewport? utils/elementIsVisibleInViewport))
-#?(:cljs (defonce convert-to-roman utils/convertToRoman))
-#?(:cljs (defonce convert-to-letters utils/convertToLetters))
 #?(:cljs (def string-join-path common-util/string-join-path))
 
 #?(:cljs
@@ -717,6 +714,30 @@
           (remove (fn [b] (d/has-class? b "property-value-container"))))))
 
 #?(:cljs
+   (defn property-value-inner-block
+     "The real `.ls-block[blockid]` inside a property-value wrapper, if any."
+     [node]
+     (when (and node (d/has-class? node "property-value-container"))
+       (.querySelector node ".ls-block[blockid]"))))
+
+#?(:cljs
+   (defn unwrap-property-value-container
+     "Map a selected property-value wrapper to its inner block."
+     [node]
+     (or (property-value-inner-block node) node)))
+
+#?(:cljs
+   (defn selection-node-block-id
+     "Block UUID for a selected node, including text property-value wrappers."
+     [node]
+     (when (some-> node .-getAttribute)
+       (when-let [id (or (d/attr node "blockid")
+                         (some-> (property-value-inner-block node)
+                                 (d/attr "blockid")))]
+         (when (uuid-string? (str id))
+           (uuid id))))))
+
+#?(:cljs
    (defn get-selected-text
      []
      (utils/getSelectionText)))
@@ -733,21 +754,18 @@
 
 #?(:cljs
    (defn copy-to-clipboard!
-     [text & {:keys [graph html blocks embed-block? owner-window]}]
-     (let [blocks (map (fn [block] (if (de/entity? block)
-                                     (-> (into {} block)
-                                         ;; FIXME: why :db/id is not included?
-                                         (assoc :db/id (:db/id block)))
-                                     block)) blocks)
+     [text & {:keys [graph html blocks embed-block? owner-window op]}]
+     (let [blocks (map identity blocks)
            data (clj->js
                  (common-util/remove-nils-non-nested
                   {:text text
                    :html html
                    :blocks (when (and graph (seq blocks))
                              (pr-str
-                              {:graph graph
+                               {:graph graph
                                :embed-block? embed-block?
-                               :blocks (mapv #(dissoc % :block.temp/load-status %) blocks)}))}))]
+                               :op op
+                               :blocks (vec blocks)}))}))]
        (if owner-window
          (write-clipboard data owner-window)
          (write-clipboard data)))))
@@ -774,9 +792,6 @@
     (println (str "Debug " k))
     (time (reset! result (doall (f))))
     @result))
-
-#?(:cljs
-   (def concat-without-nil common-util/concat-without-nil))
 
 #?(:cljs
    (defn set-title!
@@ -808,21 +823,17 @@
 #?(:cljs
    (defn- scan-sibling-block
      "Directional scan around `block` in the native array `blocks` (dir -1/1),
-      returning the first candidate passing `pred`. Reproduces the quirks of
-      the previous filter-then-indexOf implementation: when `block` is nil,
-      absent, or fails `in-list-pred`, prev returns nil and next scans from
-      index 0."
+      returning the first candidate passing `pred`. When `block` is nil,
+      absent, or fails `in-list-pred` (e.g. it was removed from the page),
+      it has no neighbour and the scan returns nil."
      ([blocks block dir pred] (scan-sibling-block blocks block dir pred pred))
      ([blocks block dir pred in-list-pred]
       (when blocks
         (let [len (alength blocks)
               i (if (some? block) (.indexOf ^js blocks block) -1)
-              in-list? (and (>= i 0) (in-list-pred (aget blocks i)))
-              start (cond in-list? (+ i dir)
-                          (neg? dir) nil
-                          :else 0)]
-          (when (some? start)
-            (loop [j start]
+              in-list? (and (>= i 0) (in-list-pred (aget blocks i)))]
+          (when in-list?
+            (loop [j (+ i dir)]
               (when (and (>= j 0) (< j len))
                 (let [b (aget blocks j)]
                   (if (pred b) b (recur (+ j dir))))))))))))
@@ -961,9 +972,6 @@
 
 #?(:cljs
    (def safe-page-name-sanity-lc common-util/safe-page-name-sanity-lc))
-
-#?(:cljs
-   (def get-page-title common-util/get-page-title))
 
 #?(:cljs
    (defn add-style!
@@ -1399,6 +1407,17 @@
    (defn rtc-test?
      []
      (string/includes? js/window.location.search "?rtc-test=true")))
+
+#?(:cljs
+   (defn rtc-test-without-virtualization?
+     []
+     (and (rtc-test?)
+          (not (string/includes? js/window.location.search "virtualized=true")))))
+
+#?(:cljs
+   (defn force-virtualization?
+     []
+     (string/includes? js/window.location.search "virtualized=true")))
 
 #?(:cljs
    (defn sanitize-port-input

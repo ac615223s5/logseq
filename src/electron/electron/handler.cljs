@@ -2,6 +2,7 @@
   "This ns starts the event handling for the electron main process and defines
   all the application-specific event types"
   (:require ["/electron/utils" :as js-utils]
+            ["@logseq/graph-lifecycle" :as lifecycle]
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
             ["electron" :refer [app dialog ipcMain shell]]
@@ -19,20 +20,21 @@
             [electron.db-worker :as db-worker]
             [electron.embedding-server :as embedding-server]
             [electron.find-in-page :as find]
+            [electron.graph-switch-flow :as graph-switch-flow]
             [electron.handler-interface :refer [handle]]
             [electron.i18n :as i18n]
             [electron.keychain :as keychain]
             [electron.logger :as logger]
-            [electron.spell-check :as spell-check]
             [electron.plugin :as plugin]
             [electron.server :as server]
             [electron.shell :as shell]
+            [electron.spell-check :as spell-check]
             [electron.state :as state]
             [electron.utils :as utils]
             [electron.window :as win]
-            [electron.graph-switch-flow :as graph-switch-flow]
             [logseq.cli.common :as cli-common]
             [logseq.cli.root-dir :as cli-root-dir]
+            [logseq.cli.server :as cli-server]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-registry :as graph-registry]
@@ -77,6 +79,9 @@
 
 (defmethod handle :readFile [_window [_ path]]
   (utils/read-file path))
+
+(defmethod handle :readGraphImportSnapshot [_window [_ path]]
+  (db/<read-import-snapshot path))
 
 (defmethod handle :readFileRaw [_window [_ path]]
   (utils/read-file-raw path))
@@ -147,11 +152,20 @@
        (remove nil?)
        vec))
 
-(defn open-dir-dialog []
-  (p/let [result (.showOpenDialog dialog (bean/->js
-                                          {:properties ["openDirectory" "createDirectory" "promptToCreate"]}))
-          result (get (js->clj result) "filePaths")]
-    (p/resolved (first result))))
+(defn open-dir-dialog
+  ([] (open-dir-dialog nil))
+  ([default-path]
+   (p/let [default-dir (when (and (string? default-path) (not (string/blank? default-path)))
+                          (-> default-path node-path/normalize node-path/dirname))
+           directory-exists? (when default-dir
+                               (-> (fs-extra/stat default-dir)
+                                   (p/then (fn [^js stat] (.isDirectory stat)))
+                                   (p/catch (constantly false))))
+           opts (cond-> {:properties ["openDirectory" "createDirectory" "promptToCreate"]}
+                  directory-exists? (assoc :defaultPath default-dir))
+           result (.showOpenDialog dialog (bean/->js opts))
+           result (get (js->clj result) "filePaths")]
+     (p/resolved (first result)))))
 
 (defn- pretty-print-js-error
   "Converts file related JS Error messages to a human readable format.
@@ -226,10 +240,31 @@
 (defmethod handle :upsertGraphRegistryEntry [_window [_ entry]]
   (cfgs/upsert-graph-registry-entry! entry))
 
-(defmethod handle :deleteGraph [_window [_ graph]]
+(defn- notify-graph-lifecycle!
+  [repo lifecycle-state]
+  (doseq [^js window (win/get-all-windows)]
+    (.send (.-webContents window) "graph-lifecycle"
+           (clj->js {:repo repo :phase (:phase lifecycle-state)
+                     :generation (:generation lifecycle-state)}))))
+
+(defmethod handle :deleteGraph [_window [_ graph expected-generation]]
   (when-let [repo (canonical-repo graph)]
-    (p/let [_ (db-worker/release-repo! repo)]
-      (cli-common/unlink-graph! repo))))
+    (let [graphs-dir (common-graph/get-db-graphs-dir)
+          current (lifecycle/snapshot (cli-server/resolve-storage {}) repo)
+          generation (when current (.-generation current))]
+      (when (and expected-generation (not= expected-generation generation))
+        (throw (ex-info "Graph generation changed" {:code :graph-not-exists :repo repo})))
+      (db-worker/invalidate-repo! db-worker/manager repo)
+      (notify-graph-lifecycle! repo {:phase "deleting" :generation generation})
+      (cli-common/<unlink-graph!
+       graphs-dir repo
+       (fn []
+         (notify-graph-lifecycle! repo {:phase "deleted" :generation generation})
+         #js {:ok true})
+       expected-generation))))
+
+(defmethod handle :createGraph [_window [_ repo exclusive?]]
+  (lifecycle/createGraph (cli-server/resolve-storage {}) (canonical-repo repo) (true? exclusive?)))
 
 ;; DB related IPCs start
 
@@ -237,17 +272,19 @@
   []
   (db-worker/stop-all-managed!))
 
-(defmethod handle :db-worker-runtime [^js window [_ repo]]
+(defmethod handle :db-worker-runtime [^js window [_ repo opts]]
   (if (string/blank? repo)
     (p/rejected (ex-info "repo is required" {:code :missing-repo}))
     (p/let [embedding-endpoint (when (cfgs/semantic-search-enabled?)
                                  (embedding-server/ensure-endpoint! app))]
-      (db-worker/ensure-runtime! (canonical-repo repo)
-                                 (.-id window)
-                                 (cond-> {}
-                                   embedding-endpoint
-                                   (assoc :embedding-endpoint embedding-endpoint
-                                          :embedding-model-id (.-LOGSEQ_EMBEDDING_MODEL js/process.env)))))))
+      (p/let [runtime (db-worker/ensure-runtime! (canonical-repo repo)
+                                                 (.-id window)
+                                                 (cond-> {:generation (:generation opts)
+                                                          :on-graph-lifecycle! notify-graph-lifecycle!}
+                                                   embedding-endpoint
+                                                   (assoc :embedding-endpoint embedding-endpoint
+                                                          :embedding-model-id (.-LOGSEQ_EMBEDDING_MODEL js/process.env))))]
+        (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?])))))
 
 (defmethod handle :releaseDbWorkerRuntime [^js window [_ repo]]
   (if (string/blank? repo)
@@ -272,12 +309,12 @@
 
 ;; DB related IPCs End
 
-(defmethod handle :openDialog [^js _window _messages]
-  (open-dir-dialog))
+(defmethod handle :openDialog [^js _window [_ default-path]]
+  (open-dir-dialog default-path))
 
-(defmethod handle :showOpenDialog [_window [_ ^js options]]
-  (p/let [^js result (.showOpenDialog dialog options)]
-    result))
+(defmethod handle :showOpenDialog [_window [_ options]]
+  (p/let [^js result (.showOpenDialog dialog (bean/->js options))]
+    (bean/->clj result)))
 
 (defmethod handle :getLogseqDotDirRoot []
   (utils/get-ls-dotdir-root))
@@ -508,15 +545,15 @@
                            :headers (response-headers->map (.-headers res))
                            :body payload}
                           payload))))
-          (p/catch
-           (fn [^js e]
+            (p/catch
+             (fn [^js e]
              ;; TODO: handle special cases
-             (throw e)))
-          (p/finally
-            (fn []
-              (when timeout-id
-                (js/clearTimeout timeout-id))
-              (swap! *request-abort-signals dissoc req-id))))))))
+               (throw e)))
+            (p/finally
+              (fn []
+                (when timeout-id
+                  (js/clearTimeout timeout-id))
+                (swap! *request-abort-signals dissoc req-id))))))))
 
 (defmethod handle :httpRequestAbort [_ [_ req-id]]
   (when-let [^js controller (get @*request-abort-signals req-id)]
@@ -568,6 +605,10 @@
 (defmethod handle :window-close [^js win]
   (.close win))
 
+(defmethod handle :set-window-title [^js win [_ title]]
+  (when (and win (string? title) (not (.isDestroyed win)))
+    (.setTitle win title)))
+
 (defmethod handle :theme-loaded [^js win]
   (.manage (windowStateKeeper) win))
 
@@ -599,7 +640,8 @@
   (server/set-config! config))
 
 (defmethod handle :system/info [^js _win _]
-  {:home-dir (.homedir os)})
+  {:home-dir (.homedir os)
+   :graphs-dir (common-graph/get-db-graphs-dir)})
 
 (defmethod handle :window/open-blank-callback [^js win [_ _type]]
   (win/setup-window-listeners! win) nil)
