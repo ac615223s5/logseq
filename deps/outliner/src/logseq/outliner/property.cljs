@@ -533,6 +533,13 @@
       (and (qualified-keyword? v) (not= :keyword property-type))
       (db-ident->eid @conn v)
 
+      ;; A uuid names an existing entity, e.g. a closed value without a db/ident
+      ;; such as a user-created status
+      (uuid? v)
+      (or (:db/id (d/entity @conn [:block/uuid v]))
+          (throw (ex-info (str "No entity with uuid " v)
+                          {:property-id property-id :v v})))
+
       (and (coll? v)
            (every? integer? v)
            (not number-property?))

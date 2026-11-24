@@ -489,6 +489,24 @@
            (mapv :db/ident (:block/tags (d/entity @conn [:block/uuid project]))))
         "Doesn't add Task to block when its class provides status")))
 
+(deftest set-closed-value-by-uuid
+  (testing "a closed value without a db/ident, e.g. a user-created status, can be set by uuid"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "page1"}
+                                     :blocks [{:block/title "task"}]}]})
+          task (:block/uuid (db-test/find-block-by-content @conn "task"))
+          _ (outliner-property/upsert-closed-value! conn :logseq.property/status {:value "Blocked"})
+          blocked (some #(when (= "Blocked" (:block/title %)) %)
+                        (:block/_closed-value-property (d/entity @conn :logseq.property/status)))]
+      (is (nil? (:db/ident blocked)))
+      (outliner-property/batch-set-property! conn [task] :logseq.property/status (:block/uuid blocked))
+      (is (= (:db/id blocked)
+             (:db/id (:logseq.property/status (d/entity @conn [:block/uuid task])))))
+      (is (thrown-with-msg?
+           js/Error
+           #"No entity with uuid"
+           (outliner-property/batch-set-property! conn [task] :logseq.property/status (random-uuid)))))))
+
 (deftest task-child-class-does-not-add-parent-task-tag
   (let [tag-idents (fn [conn block-uuid]
                      (set (map :db/ident (:block/tags (d/entity @conn [:block/uuid block-uuid])))))]
