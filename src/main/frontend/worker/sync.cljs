@@ -311,6 +311,11 @@
                              (seq remote-name) (assoc :remote-graph-name remote-name)
                              (seq same-name-id) (assoc :relink-candidate-graph-id same-name-id))]
                   (log/error :db-sync/graph-not-on-server data)
+                  ;; Sync stops retrying from here on, so without this the
+                  ;; graph sits unsynced with nothing on screen saying so.
+                  (shared-service/broadcast-to-clients!
+                   :notification
+                   [nil :warning false nil nil {:i18n-key :sync/graph-not-on-server-warning}])
                   (sync-util/set-last-sync-error!
                    client
                    (ex-info "local graph is not on the sync server; re-link it by downloading the remote graph or uploading this one"

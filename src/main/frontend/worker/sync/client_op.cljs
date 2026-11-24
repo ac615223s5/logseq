@@ -425,6 +425,34 @@
        :created-at created-at'
        :should-inc-pending? should-inc-pending?})))
 
+(defn adopt-merged-remote!
+  "Bookkeeping for a graph just merged with a remote graph.
+
+  The merged graph adopts the remote graph's history, so local-tx becomes the
+  remote's counter - which can legitimately be lower than the current one when
+  the remote is a different (e.g. re-uploaded) graph; counters are per graph.
+  Pending txs are superseded by `push-entry`: their effects are already in the
+  local graph, and push-entry carries everything the merged graph has that the
+  server lacks, computed against the snapshot. Replaying them on top would
+  re-send stale edits made against the old remote, and a rejected one rolls
+  the user's edit back. Runs as one sqlite transaction so a crash cannot leave
+  the pending txs dropped without the push entry."
+  [repo remote-tx push-entry]
+  {:pre [(and (integer? remote-tx) (>= remote-tx 0))]}
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (sqlite-with-tx!
+     store
+     (fn [_]
+       (sqlite-run! store
+                    "update client_ops set pending = 0 where kind = 'tx' and pending = 1"
+                    [])
+       (when push-entry
+         (upsert-local-tx-entry! repo push-entry))
+       (sqlite-set-meta! store :local-tx remote-tx)))
+    (swap! *repo->pending-local-tx-count dissoc repo)
+    nil))
+
 (defn get-local-tx-entry
   [repo tx-id]
   (when (uuid? tx-id)

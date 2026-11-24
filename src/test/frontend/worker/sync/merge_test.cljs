@@ -208,3 +208,66 @@
           {:keys [conflicts stats]} (reconcile db datoms)]
       (is (empty? conflicts))
       (is (= 1 (:unresolved-conflicts stats))))))
+
+(defn- merge-all
+  "Runs the whole merge against `conn` the way <merge-imported-rows! does and
+  returns the tx-data that would be pushed to the server."
+  [conn remote-datoms]
+  (let [index (sync-merge/index-remote-datoms (sync-merge/identity-datoms remote-datoms))
+        _ (d/transact! conn (vec (sync-merge/new-entity-tx-data @conn index)))
+        mapping (sync-merge/build-id-mapping @conn index (distinct (map :e remote-datoms)))
+        {:keys [tx-data]} (sync-merge/reconcile @conn remote-datoms
+                                                {:schema schema :remote-t 7
+                                                 :index index :mapping mapping})
+        _ (when (seq tx-data) (d/transact! conn tx-data))]
+    (sync-merge/local-push-tx-data @conn index
+                                   (sync-merge/mapped-eavs schema mapping remote-datoms)
+                                   {:ignored-attrs #{:block/tx-id}
+                                    :ignored-idents #{}})))
+
+(deftest local-push-tx-data-carries-only-what-the-server-lacks-test
+  (let [conn (d/conn-from-db (local-db [{:block/uuid uuid-a :block/title "local edit"}
+                                        {:block/uuid uuid-c :block/title "local only"
+                                         :block/tx-id 99}]))
+        a-eid (:db/id (d/entity @conn [:block/uuid uuid-a]))
+        _ (d/transact! conn [[:db/add [:block/uuid uuid-c] :block/parent a-eid]])
+        push (merge-all conn [{:e 700 :a :block/uuid :v uuid-a}
+                              {:e 700 :a :block/title :v "remote edit"}
+                              {:e 800 :a :block/uuid :v uuid-b}
+                              {:e 800 :a :block/title :v "remote only"}])]
+    (is (= #{[:db/add [:block/uuid uuid-a] :block/title "local edit"]
+             [:db/add (str uuid-c) :block/uuid uuid-c]
+             [:db/add (str uuid-c) :block/title "local only"]
+             [:db/add (str uuid-c) :block/parent [:block/uuid uuid-a]]}
+           (set push))
+        "the kept local value and the local-only block, nothing the server has, no ignored attrs")))
+
+(deftest local-push-tx-data-makes-the-server-match-the-merged-graph-test
+  (let [remote-db (local-db [{:db/id 700 :block/uuid uuid-a :block/title "remote edit"}
+                             {:db/id 800 :block/uuid uuid-b :block/title "remote only"}])
+        remote-datoms (map (fn [d] {:e (:e d) :a (:a d) :v (:v d)}) (d/datoms remote-db :eavt))
+        conn (d/conn-from-db (local-db [{:block/uuid uuid-a :block/title "local edit"}
+                                        {:block/uuid uuid-c :block/title "local only"}]))
+        push (merge-all conn remote-datoms)
+        server-db (d/db-with remote-db push)
+        content (fn [db]
+                  (->> (d/datoms db :avet :block/uuid)
+                       (map (fn [d]
+                              (let [e (d/entity db (:e d))]
+                                [(:block/uuid e) (:block/title e)])))
+                       set))]
+    (is (= (content @conn) (content server-db)))))
+
+(deftest merge-remaps-ref-values-of-property-attrs-test
+  (testing "ref-ness comes from the snapshot schema, so property refs are remapped"
+    (let [schema' (assoc schema :user.property/status {:db/valueType :db.type/ref})
+          db (d/db-with (d/empty-db schema')
+                        [{:block/uuid uuid-a :block/title "task"}
+                         {:block/uuid uuid-b :block/title "Blocked"}])
+          b-eid (:db/id (d/entity db [:block/uuid uuid-b]))
+          datoms [{:e 700 :a :block/uuid :v uuid-a}
+                  {:e 900 :a :block/uuid :v uuid-b}
+                  {:e 700 :a :user.property/status :v 900}]
+          {:keys [tx-data]} (sync-merge/reconcile db datoms {:schema schema' :remote-t 1})
+          db' (d/db-with db tx-data)]
+      (is (= b-eid (:db/id (:user.property/status (d/entity db' [:block/uuid uuid-a]))))))))

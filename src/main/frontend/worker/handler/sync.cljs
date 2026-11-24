@@ -6,7 +6,8 @@
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
-            [frontend.worker.sync.download :as sync-download]))
+            [frontend.worker.sync.download :as sync-download]
+            [promesa.core :as p]))
 
 (def-thread-api :thread-api/set-db-sync-config
   [config]
@@ -107,4 +108,9 @@
 ;; download-graph-by-id! which replaces it. Returns :conflicts and :stats.
 (def-thread-api :thread-api/db-sync-merge-graph-by-id
   [repo graph-id graph-e2ee?]
-  (sync-download/merge-graph-by-id! repo graph-id graph-e2ee?))
+  ;; The merge rewrites this graph's pending txs and tx counter; a live client
+  ;; would keep uploading against the old binding meanwhile.
+  (p/do!
+   (when (= repo (:repo @worker-state/*db-sync-client))
+     (db-sync/stop!))
+   (sync-download/merge-graph-by-id! repo graph-id graph-e2ee?)))

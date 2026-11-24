@@ -340,11 +340,12 @@
                                  (is false (str error))
                                  (done)))))))))))
 
-(deftest db-sync-import-prepare-reset-unlinks-db-before-reopen-test
+(deftest db-sync-import-reset-replaces-local-db-only-on-finalize-test
   (async done
     (restoring-worker-state
      (fn []
        (let [prepare (@thread-api/*thread-apis :thread-api/db-sync-import-prepare)
+             finalize (@thread-api/*thread-apis :thread-api/db-sync-import-finalize)
              conn (d/create-conn db-schema/schema)
              calls (atom [])]
          (with-fake-create-or-open-db
@@ -363,24 +364,26 @@
                                    (swap! worker-state/*datascript-conns assoc repo conn)
                                    (p/resolved nil))}
            (fn []
-             (-> (prepare test-repo true "graph-1" false)
-                 (p/then (fn [_]
-                           (let [ops (mapv first @calls)
-                                 idx (fn [op]
-                                       (first (keep-indexed (fn [i v]
-                                                              (when (= op v) i))
-                                                            ops)))]
-                             (is (some? (idx :close)))
-                             (is (some? (idx :unlink)))
-                             (is (some? (idx :invalidate-search)))
-                             (is (some? (idx :create-or-open)))
-                             (is (< (idx :close) (idx :unlink)))
-                             (is (< (idx :unlink) (idx :invalidate-search)))
-                             (is (< (idx :invalidate-search) (idx :create-or-open))))
-                           (done)))
+             (-> (p/with-redefs [sync-download/complete-datoms-import! (fn [& _] (p/resolved :ok))]
+                   (p/let [{:keys [import-id]} (prepare test-repo true "graph-1" false)
+                           _ (is (empty? @calls)
+                                 "staging a download must not touch the local graph")
+                           _ (finalize test-repo "graph-1" 42 import-id)]
+                     (let [ops (mapv first @calls)
+                           idx (fn [op]
+                                 (first (keep-indexed (fn [i v]
+                                                        (when (= op v) i))
+                                                      ops)))]
+                       (is (some? (idx :close)))
+                       (is (some? (idx :unlink)))
+                       (is (some? (idx :invalidate-search)))
+                       (is (some? (idx :create-or-open)))
+                       (is (< (idx :close) (idx :unlink)))
+                       (is (< (idx :unlink) (idx :invalidate-search)))
+                       (is (< (idx :invalidate-search) (idx :create-or-open))))))
                  (p/catch (fn [error]
-                            (is false (str error))
-                            (done)))))))))))
+                            (is false (str error))))
+                 (p/finally (fn [] (done)))))))))))
 
 (deftest db-sync-import-finalize-rejects-stale-import-id-test
   (async done

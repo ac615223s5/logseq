@@ -16,7 +16,8 @@
   the local value stays live and the remote value is recorded as a conflict for
   the user to resolve, matching how remote-sync-conflicts already behaves during
   tx apply. Nothing is dropped on either side without being surfaced."
-  (:require [datascript.core :as d]))
+  (:require [datascript.core :as d]
+            [logseq.db.common.normalize :as db-normalize]))
 
 (defn ref-attr?
   [schema a]
@@ -172,3 +173,64 @@
     {:tx-data (persistent! (:tx-data result))
      :conflicts (persistent! (:conflicts result))
      :stats (:stats result)}))
+
+(defn mapped-eavs
+  "The snapshot's datoms as [local-eid a v] triples, ref values remapped. Needs
+  the mapping built after the shells were created, so every remote entity with
+  an identity resolves to a real local id."
+  [schema mapping datoms]
+  (into #{}
+        (keep (fn [{:keys [e a v]}]
+                (let [eid (get mapping e)
+                      v' (if (ref-attr? schema a) (get mapping v) v)]
+                  (when (and (integer? eid) (some? v'))
+                    [eid a v']))))
+        datoms))
+
+(def ^:private schema-attr-order
+  {:db/ident 0 :db/valueType 1 :db/cardinality 2})
+
+(defn local-push-tx-data
+  "Upload tx-data that brings the server up to the merged local graph.
+
+  The merge keeps local values where both sides diverge and keeps local-only
+  entities, but none of that is a local transaction, so nothing would ever send
+  it: the server would keep its own content while both sides report the same tx
+  counter - a permanent, silent checksum mismatch, and later uploads touching
+  local-only entities are rejected for referencing blocks the server lacks.
+
+  Returns the local datoms the snapshot lacks, normalized the way local txs are:
+  entities the server already has are addressed by lookup, local-only ones by
+  tempid so the server creates them. `remote-eavs` is mapped-eavs over the
+  whole snapshot."
+  [local-db {:keys [e->uuid e->ident]} remote-eavs {:keys [ignored-attrs ignored-idents]}]
+  (let [remote-uuids (set (vals e->uuid))
+        remote-idents (set (vals e->ident))
+        identity-eids (into #{}
+                            (comp (mapcat #(d/datoms local-db :avet %))
+                                  (map :e))
+                            [:block/uuid :db/ident])
+        remote-eids (into #{}
+                          (comp (mapcat (fn [[a vs]]
+                                          (map #(d/entity local-db [a %]) vs)))
+                                (keep :db/id))
+                          [[:block/uuid remote-uuids] [:db/ident remote-idents]])
+        ignored-eids (into #{} (keep #(:db/id (d/entity local-db %))) ignored-idents)
+        ->id (fn [eid]
+               (when (contains? identity-eids eid)
+                 (if (contains? remote-eids eid)
+                   (db-normalize/eid->lookup local-db eid)
+                   (db-normalize/eid->tempid local-db eid))))
+        schema (d/schema local-db)]
+    (->> (d/datoms local-db :eavt)
+         (keep (fn [{:keys [e a v]}]
+                 (when (and (contains? identity-eids e)
+                            (not (contains? ignored-eids e))
+                            (not (contains? ignored-attrs a))
+                            (not (contains? remote-eavs [e a v])))
+                   (let [e' (->id e)
+                         v' (if (ref-attr? schema a) (->id v) v)]
+                     (when (and (some? e') (some? v'))
+                       [:db/add e' a v'])))))
+         (sort-by (fn [[_ _ a]] (get schema-attr-order a 3)))
+         vec)))

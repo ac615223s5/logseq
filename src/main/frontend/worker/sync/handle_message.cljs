@@ -165,6 +165,12 @@
                                     :remote-checksum remote-checksum})]
           (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
           (log/error :db-sync/checksum-mismatch mismatch-data)
+          ;; Every later ack re-detects this; tell the user once per episode.
+          (when-not (= :db-sync/checksum-mismatch
+                       (some-> (:last-sync-error client) deref :code))
+            (shared-service/broadcast-to-clients!
+             :notification
+             [nil :warning false nil nil {:i18n-key :sync/checksum-mismatch-warning}]))
           (sync-util/set-last-sync-error!
            client
            (ex-info "local graph diverges from the server: all transactions applied but content differs; re-download the remote graph to resync"

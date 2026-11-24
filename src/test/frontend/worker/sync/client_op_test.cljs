@@ -1,6 +1,5 @@
 (ns frontend.worker.sync.client-op-test
-  (:require [cljs.test :refer [deftest is testing]]
-            [frontend.worker.state :as worker-state]
+  (:require [cljs.test :refer [deftest is testing]]            [frontend.worker.state :as worker-state]
             [frontend.worker.sync.client-op :as client-op]
             [logseq.db.common.sqlite :as common-sqlite]
             [logseq.db.sqlite.gc :as sqlite-gc]))
@@ -59,6 +58,30 @@
         (client-op/update-local-checksum repo "checksum-1" 41)
         (is (= "checksum-1" (client-op/get-local-checksum repo)))
         (is (= 41 (client-op/get-local-checksum-covered-tx repo)))))))
+
+(deftest adopt-merged-remote-moves-counter-back-and-supersedes-pending-test
+  (testing "merging into a re-uploaded remote graph adopts its lower counter"
+    (let [repo "repo-merge"
+          stale-tx-id (random-uuid)
+          push-tx-id (random-uuid)
+          push-tx-data [[:db/add "uuid-1" :block/title "local only"]]]
+      (with-client-ops-db
+        repo
+        (fn [_db]
+          (client-op/update-local-tx repo 10203)
+          (client-op/upsert-local-tx-entry! repo {:tx-id stale-tx-id
+                                                  :normalized-tx-data [[:db/add "x" :block/title "stale"]]})
+          (is (= 1 (client-op/get-pending-local-tx-count repo)))
+          (client-op/adopt-merged-remote! repo 21 {:tx-id push-tx-id
+                                                   :outliner-op :fix
+                                                   :normalized-tx-data push-tx-data})
+          (is (= 21 (client-op/get-local-tx repo)))
+          (is (= [push-tx-id] (mapv :tx-id (client-op/get-pending-local-txs repo)))
+              "the stale pending tx is superseded by the merge push")
+          (is (= 1 (client-op/get-pending-local-tx-count repo)))
+          (is (thrown-with-msg? js/Error #"monotonically"
+                                (client-op/update-local-tx repo 20))
+              "ordinary counter updates are still guarded"))))))
 
 (deftest sqlite-asset-ops-coalescing-test
   (let [repo "repo-asset"

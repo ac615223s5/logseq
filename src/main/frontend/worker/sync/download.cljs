@@ -8,8 +8,10 @@
    [frontend.worker.search :as search]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
+   [frontend.worker.sync.apply-txs :as sync-apply]
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
+   [frontend.worker.sync.const :as rtc-const]
    [frontend.worker.sync.crypt :as sync-crypt]
    [frontend.worker.sync.log-and-state :as rtc-log-and-state]
    [frontend.worker.sync.merge :as sync-merge]
@@ -434,12 +436,20 @@
   the live db, keeping local values where both sides diverge and collecting the
   remote ones as conflicts.
 
-  Returns {:conflicts [...] :stats {...}}."
+  Ref-ness and cardinality of the snapshot's datoms come from the snapshot's
+  own schema: the static base schema knows nothing about property attributes,
+  so ref property values (status, user ref properties, ...) would otherwise be
+  copied over as raw remote entity ids instead of being remapped.
+
+  Returns {:conflicts [...] :stats {...} :push-tx-data [...]}, where
+  :push-tx-data is what the server lacks from the merged graph (see
+  sync-merge/local-push-tx-data)."
   [{:keys [conn rows-db aes-key graph-e2ee? graph-id import-id]} remote-t]
   (if (nil? rows-db)
-    (p/resolved {:conflicts [] :stats {}})
+    (p/resolved {:conflicts [] :stats {} :push-tx-data []})
     (let [source-storage (sync-temp-sqlite/new-temp-sqlite-storage rows-db)
           source-conn (common-sqlite/get-storage-conn source-storage db-schema/schema)
+          remote-schema (d/schema @source-conn)
           all-datoms (snapshot-datoms-in-import-order source-conn)
           index (sync-merge/index-remote-datoms (sync-merge/identity-datoms all-datoms))
           shells (sync-merge/new-entity-tx-data @conn index)]
@@ -448,13 +458,14 @@
               mapping (sync-merge/build-id-mapping @conn index (distinct (map :e all-datoms)))]
         (p/loop [remaining (seq all-datoms)
                  conflicts []
-                 stats {}]
+                 stats {}
+                 remote-eavs #{}]
           (if (seq remaining)
             (let [[batch remaining'] (take-import-datoms-batch remaining snapshot-import-datoms-batch-size)]
               (p/let [batch' (<decrypt-datoms aes-key graph-e2ee? batch)
                       {:keys [tx-data] :as result}
                       (sync-merge/reconcile @conn batch'
-                                            {:schema db-schema/schema
+                                            {:schema remote-schema
                                              :remote-t remote-t
                                              :index index
                                              :mapping mapping})
@@ -464,35 +475,56 @@
                       _ (<yield-next-tick)]
                 (p/recur remaining'
                          (into conflicts (:conflicts result))
-                         (merge-with + stats (:stats result)))))
-            (p/resolved {:conflicts conflicts :stats stats})))))))
+                         (merge-with + stats (:stats result))
+                         (into remote-eavs (sync-merge/mapped-eavs remote-schema mapping batch')))))
+            (p/resolved {:conflicts conflicts
+                         :stats stats
+                         :push-tx-data (sync-merge/local-push-tx-data
+                                        @conn index remote-eavs
+                                        {:ignored-attrs sync-apply/rtc-ignored-attrs
+                                         :ignored-idents rtc-const/ignore-entities-when-init-upload})})))))))
+
+(defn- <open-import-conn!
+  [repo]
+  (p/let [create-or-open-db-f (require-thread-api-f! :thread-api/create-or-open-db)
+          _ (create-or-open-db-f repo {:close-other-db? true
+                                       :sync-download-graph? true})
+          conn (worker-state/get-datascript-conn repo)]
+    (when-not conn
+      (fail-fast :db-sync/missing-field {:repo repo :field :datascript-conn}))
+    conn))
+
+(defn- <replace-local-db!
+  "Destroys the local graph and opens an empty one in its place. Runs only once
+  the whole snapshot is staged in the temp rows db, so a download that dies
+  while streaming leaves the local graph untouched."
+  [repo]
+  (p/let [close-db-f (require-thread-api-f! :thread-api/db-sync-close-db)
+          unlink-db-f (require-thread-api-f! :thread-api/unsafe-unlink-db)
+          invalidate-search-db-f (require-thread-api-f! :thread-api/db-sync-invalidate-search-db)
+          _ (close-db-f repo)
+          _ (unlink-db-f repo)
+          _ (invalidate-search-db-f repo)]
+    (<open-import-conn! repo)))
 
 (defn prepare-import!
+  "Starts staging a snapshot. Nothing local is touched here: with `reset?` the
+  local graph is only replaced by finalize-import!, after every row has been
+  staged."
   [repo reset? graph-id graph-e2ee? & [total-datoms]]
   (let [graph-e2ee? (if (nil? graph-e2ee?) true (true? graph-e2ee?))]
-    (-> (p/let [close-db-f (require-thread-api-f! :thread-api/db-sync-close-db)
-                unlink-db-f (require-thread-api-f! :thread-api/unsafe-unlink-db)
-                invalidate-search-db-f (require-thread-api-f! :thread-api/db-sync-invalidate-search-db)
-                create-or-open-db-f (require-thread-api-f! :thread-api/create-or-open-db)
-                _ (when-let [state @*import-state]
-                    (close-import-state! state)
-                    (close-db-f (:repo state)))
+    (-> (p/let [_ (when-let [state @*import-state]
+                    (close-import-state! state))
                 _ (reset! *import-state nil)
-                _ (when reset? (close-db-f repo))
-                _ (when reset? (unlink-db-f repo))
-                _ (when reset? (invalidate-search-db-f repo))
                 import-id (str (random-uuid))
                 aes-key (when graph-e2ee?
                           (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
                 _ (when (and graph-e2ee? (nil? aes-key))
                     (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
-                _ (create-or-open-db-f repo {:close-other-db? true
-                                             :sync-download-graph? true})
-                conn (worker-state/get-datascript-conn repo)
-                _ (when-not conn
-                    (fail-fast :db-sync/missing-field {:repo repo :field :datascript-conn}))]
+                conn (when-not reset? (<open-import-conn! repo))]
           (reset! *import-state {:aes-key aes-key
                                  :conn conn
+                                 :reset? (true? reset?)
                                  :graph-e2ee? graph-e2ee?
                                  :graph-id graph-id
                                  :import-id import-id
@@ -527,6 +559,12 @@
 (defn finalize-import!
   [repo graph-id remote-tx import-id]
   (-> (p/let [state (require-import-state! repo graph-id import-id)
+              state (if (:reset? state)
+                      (p/let [conn (<replace-local-db! repo)
+                              ;; a newer import may have started meanwhile
+                              state (require-import-state! repo graph-id import-id)]
+                        (assoc state :conn conn))
+                      state)
               _ (when (:rows-imported? state)
                   (<replay-imported-rows! state))
               result (complete-datoms-import! repo graph-id remote-tx)
@@ -648,6 +686,23 @@
                             :graph-id graph-id
                             :base base})))))
 
+(defn- merge-push-entry
+  "A pending :fix tx carrying the merged graph's local side to the server.
+  :fix entries are uploaded as recorded and kept as-is across rebases."
+  [push-tx-data]
+  (when (seq push-tx-data)
+    {:tx-id (random-uuid)
+     :created-at (.now js/Date)
+     :pending? true
+     :failed? false
+     :outliner-op :fix
+     :undo-redo :none
+     :forward-outliner-ops []
+     :inverse-outliner-ops []
+     :inferred-outliner-ops? false
+     :normalized-tx-data push-tx-data
+     :reversed-tx-data []}))
+
 (defn merge-graph-by-id!
   "Link this graph to an existing remote graph without discarding either side.
 
@@ -708,20 +763,23 @@
                         _ (reset! stage* :reconcile)
                         state (when-let [import-id @import-id*]
                                 (require-import-state! repo graph-id import-id))
-                        {:keys [conflicts stats]} (if state
-                                                    (<merge-imported-rows! state remote-tx)
-                                                    (p/resolved {:conflicts [] :stats {}}))
+                        {:keys [conflicts stats push-tx-data]}
+                        (if state
+                          (<merge-imported-rows! state remote-tx)
+                          (p/resolved {:conflicts [] :stats {} :push-tx-data []}))
                         _ (when (seq conflicts)
                             (client-op/add-sync-conflicts! repo conflicts))
                         _ (when-let [import-id @import-id*]
                             (clear-import-state! import-id))
-                        _ (client-op/update-local-tx repo remote-tx)]
+                        _ (client-op/adopt-merged-remote! repo remote-tx
+                                                          (merge-push-entry push-tx-data))]
                   (when-let [conn (worker-state/get-datascript-conn repo)]
                     (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?
                                               (common-config/strip-leading-db-version-prefix repo)))
                   (log/info :db-sync/merge-graph-completed
                             {:repo repo :graph-id graph-id :remote-tx remote-tx
-                             :conflict-count (count conflicts) :stats stats})
+                             :conflict-count (count conflicts) :stats stats
+                             :push-datom-count (count push-tx-data)})
                   (log-f {:sub-type :download-completed
                           :graph-uuid graph-id
                           :message "Graph merged"})
